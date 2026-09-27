@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.27) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.28) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1914,7 +1914,7 @@ sfxW2Dinstall(void)
 }
 
 // ------------------------------------------------------------------
-// v9.27: real-time shadow upgrade (opt-in, hardened two-site patch)
+// v9.28: real-time shadow upgrade (opt-in, hardened full-chain patch)
 //
 // History: v9.21 (entry trampolines) crashed inside
 // CRealTimeShadow::Create. v9.22 required a push DIRECTLY in front of
@@ -1959,6 +1959,14 @@ sfxW2Dinstall(void)
 // what is actually drawn on the ground) scales to res-1, doubling
 // the visible ground shadow resolution from 64x64 to 128x128 at
 // res = 8. Every write is read back and verified in the log.
+// v9.27 result: stable, both writes verified - but the shadows
+// DISAPPEARED. Raising only the per object blur raster breaks the
+// chain: the manager level blur and gradient cameras are still
+// 64x64 and the soften/gradient path mixes surfaces of mismatched
+// size. v9.28 therefore also scales the two "push 6" cameras inside
+// CRealTimeShadowManager::Init so every camera in the pipeline
+// matches. If the shadows still do not come back, the ground
+// texture theory is wrong and the final build stays entity-only.
 // ------------------------------------------------------------------
 static unsigned int sfxShadowCamCreateAddr = 0x705B60;	// CShadowCamera::Create(int)
 static unsigned char sfxRTShadowApplied;
@@ -2037,7 +2045,7 @@ void
 rtshadowhooks(void)
 {
 	int res = config->shadowResolution;
-	unsigned int calls[4];
+	unsigned int calls[4], mfcalls[4];
 	unsigned int p, bp;
 	int blurPow;
 	if(sfxRTShadowApplied)
@@ -2102,6 +2110,26 @@ rtshadowhooks(void)
 		sfxRTwriteByte(bp + 1, (unsigned char)blurPow);
 		sfxLogLine("RT shadow: blur push 6 -> %d @%08x imm@%08x readback=%d\n",
 			blurPow, bp, bp + 1, (int)((unsigned char*)bp)[1]);
+	}
+	// sites 3+4 (v9.28): the manager level blur and gradient cameras
+	// (CRealTimeShadowManager::Init) - raise them too so the whole
+	// chain runs at matching sizes
+	if(sfxRTfindCalls(0x7067C0, 0x706870, sfxShadowCamCreateAddr, mfcalls, 4) == 2){
+		int mi;
+		for(mi = 0; mi < 2; mi++){
+			unsigned int mp = sfxRTfindPushImm(mfcalls[mi], 6);
+			if(mp == 0 || ((unsigned char*)mp)[0] != 0x6A || ((unsigned char*)mp)[1] != 0x06){
+				sfxLogLine("install: rtshadow manager site %d not found (call@%08x)\n", mi, mfcalls[mi]);
+			}else if(blurPow == 6){
+				sfxLogLine("install: rtshadow manager site %d ok res=%d (vanilla 6 - nothing patched)\n", mi, res);
+			}else{
+				sfxRTwriteByte(mp + 1, (unsigned char)blurPow);
+				sfxLogLine("RT shadow: manager push 6 -> %d @%08x imm@%08x readback=%d\n",
+					blurPow, mp, mp + 1, (int)((unsigned char*)mp)[1]);
+			}
+		}
+	}else{
+		sfxLogLine("install: rtshadow manager call count mismatch - skipped\n");
 	}
 	sfxLogLine("install: rtshadow ok res=%d blur=%d (literal patch, readback verified)\n", res, blurPow);
 }
