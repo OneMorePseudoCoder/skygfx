@@ -877,6 +877,8 @@ InitialiseGame_hook(void)
 
 void envmaphooks(void);
 envmaphooks();
+void rtshadowhooks(void);
+	rtshadowhooks();
 	neoInit();
 	initTexDB();
 	InitialiseGame();
