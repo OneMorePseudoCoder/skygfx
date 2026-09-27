@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.23) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.24b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1914,29 +1914,35 @@ sfxW2Dinstall(void)
 }
 
 // ------------------------------------------------------------------
-// v9.23: real-time shadow upgrade (single-site literal patch)
+// v9.24: real-time shadow upgrade (opt-in, hardened single-site patch)
 //
 // History: v9.21 (entry trampolines) crashed inside
 // CRealTimeShadow::Create. v9.22 required a push DIRECTLY in front of
 // the call and matched zero sites (MSVC puts the thiscall ECX load
-// between the argument push and the call). v9.22c located the pushes
-// in a 16 byte window in front of each verified call site - and still
-// crashed, this time inside CRealTimeShadowManager::Init (the crash
-// registers sat on the manager pool/gradient camera area), so some
-// part of the manager path does not tolerate the changed sizes on
-// this setup. v9.23 therefore changes exactly ONE byte: the "push 7"
-// argument of the FIRST CShadowCamera::Create call inside
-// CRealTimeShadow::Create - the entity shadow raster. That raster is
-// the source of the visible ground shadow (vanilla 128x128, already
-// downsampled to 64x64 afterwards), so raising it alone is where all
-// the visual win is. Manager::Init, the gradient raster, the blur
-// raster and the blur pass count stay 100% vanilla, so the path that
-// crashed can not regress. The byte is located and validated (call
-// count + window search) before anything is written; any mismatch
-// logs ABORT and leaves the game pure vanilla.
-// shadowResolution = 7 (or unset) modifies nothing at all.
-// shadowSoftness and shadowAllEntities are reserved (unused) in this
-// build.
+// between the argument push and the call). v9.22c found the pushes
+// with a 16 byte window but crashed inside Manager::Init. v9.23
+// tightened to one byte with the same 16 byte window and crashed with
+// EIP = 0x1 - a jump into garbage, which is what a byte written into
+// the middle of an unrelated instruction produces: the loose window
+// could match a stale 6A 07 that was not the argument push at all.
+// v9.24 therefore hardens everything:
+//   - the push must sit within 7 bytes in front of the call
+//     (push 7 + up to 5 bytes of thiscall ECX setup)
+//   - if the gap is non empty its first byte must be a plausible
+//     setup opcode (8B/8D mov-lea or 50..57 push)
+//   - the create functions must not already be jmp-hooked (E9) by
+//     another mod, otherwise the code region may be relocated
+//   - everything is logged: the push address and its distance to the
+//     call, so the log can be diagnosed without a debugger
+// The patched byte is still only the "push 7" argument of the FIRST
+// CShadowCamera::Create call inside CRealTimeShadow::Create - the
+// entity shadow raster, the source of the visible ground shadow.
+// Manager::Init, gradient/blur rasters and blur passes stay 100%
+// vanilla. DEFAULT IS NOW 7 = VANILLA: nothing is patched unless the
+// ini explicitly opts in with shadowResolution >= 8, which should be
+// treated as experimental (three crashes on three designs point at
+// the environment, not the idea - the new logging will tell).
+// shadowSoftness and shadowAllEntities stay reserved (unused).
 // ------------------------------------------------------------------
 static unsigned int sfxShadowCamCreateAddr = 0x705B60;	// CShadowCamera::Create(int)
 static unsigned char sfxRTShadowApplied;
@@ -1965,19 +1971,28 @@ sfxRTfindCalls(unsigned int start, unsigned int end, unsigned int target,
 	return n;
 }
 
-// last "push from" (6A from) at or after minAddr and before callAddr;
-// returns its address or 0 if there is none
+// the argument push for the call at callAddr: a "6A 07" within 7 bytes
+// in front of it, optionally followed by a thiscall ECX setup. Returns
+// the push address or 0.
 static unsigned int
-sfxRTfindPush(unsigned int minAddr, unsigned int callAddr, unsigned char from)
+sfxRTfindPush7(unsigned int callAddr)
 {
-	unsigned int a;
-	unsigned int found = 0;
-	for(a = minAddr; a + 1 < callAddr; a++){
-		unsigned char *p = (unsigned char*)a;
-		if(p[0] == 0x6A && p[1] == from)
-			found = a;
+	unsigned int p, best = 0;
+	unsigned int minA = callAddr >= 7 ? callAddr - 7 : callAddr;
+	for(p = minA; p + 2 <= callAddr; p++){
+		unsigned char *q = (unsigned char*)p;
+		if(q[0] == 0x6A && q[1] == 7)
+			best = p;
 	}
-	return found;
+	if(best != 0){
+		int dist = (int)(callAddr - best);
+		if(dist > 2){
+			unsigned char g = ((unsigned char*)best)[2];
+			if(g != 0x8B && g != 0x8D && (g < 0x50 || g > 0x57))
+				return 0;	// gap does not look like a this pointer setup
+		}
+	}
+	return best;
 }
 
 void
@@ -1985,31 +2000,36 @@ rtshadowhooks(void)
 {
 	int res = config->shadowResolution;
 	unsigned int calls[4];
-	unsigned int minA, p;
+	unsigned int p;
 	if(sfxRTShadowApplied)
 		return;
 	sfxRTShadowApplied = 1;
 	if(res < 6) res = 6;
 	if(res > 10) res = 10;
 
-	// validate first, write last - and only one byte
+	if(((unsigned char*)0x706460)[0] == 0xE9 ||
+	   ((unsigned char*)sfxShadowCamCreateAddr)[0] == 0xE9){
+		sfxLogLine("install: rtshadow ABORT - create functions already hooked\n");
+		return;
+	}
 	if(sfxRTfindCalls(0x706460, 0x706520, sfxShadowCamCreateAddr, calls, 4) != 2){
 		sfxLogLine("install: rtshadow ABORT - Create call count\n");
 		return;
 	}
-	minA = calls[0] - 16;
-	if(minA < 0x706460) minA = 0x706460;
-	p = sfxRTfindPush(minA, calls[0], 7);
+	p = sfxRTfindPush7(calls[0]);
 	if(p == 0){
-		sfxLogLine("install: rtshadow ABORT - push 7 not found\n");
+		sfxLogLine("install: rtshadow ABORT - push 7 not found (hardened window, call@%08x)\n", calls[0]);
 		return;
 	}
 	if(res == 7){
-		sfxLogLine("install: rtshadow ok res=7 (vanilla - nothing patched)\n");
+		sfxLogLine("install: rtshadow ok res=7 (vanilla - nothing patched, push@%08x dist=%d)\n",
+			p, (int)(calls[0] - p));
 		return;
 	}
+	sfxLogLine("install: rtshadow EXPERIMENTAL res=%d push@%08x call@%08x dist=%d\n",
+		res, p, calls[0], (int)(calls[0] - p));
 	sfxRTwriteByte(p, (unsigned char)res);
-	sfxLogLine("RT shadow: push 7 -> %d @%08x\n", res, p);
+	sfxLogLine("RT shadow: push 7 -> %d @%08x (dist %d)\n", res, p, (int)(calls[0] - p));
 	sfxLogLine("install: rtshadow ok res=%d soft=vanilla (single-site literal patch, 1 byte)\n", res);
 }
 

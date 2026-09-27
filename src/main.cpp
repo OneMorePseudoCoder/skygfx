@@ -1163,6 +1163,12 @@ readIni(int n)
 	if(c->renderScale < 0.5f) c->renderScale = 0.5f;
 	if(c->renderScale > 1.0f) c->renderScale = 1.0f;
 	c->renderScaleDebugLog = readint(cfg.get("SkyGfx", "renderScaleDebugLog", ""), 0);
+	c->shadowResolution = readint(cfg.get("SkyGfx", "shadowResolution", ""), 7);
+	if(c->shadowResolution < 6) c->shadowResolution = 6;
+	if(c->shadowResolution > 10) c->shadowResolution = 10;
+	c->shadowSoftness = readint(cfg.get("SkyGfx", "shadowSoftness", ""), -1);
+	if(c->shadowSoftness > 8) c->shadowSoftness = 8;
+	c->shadowAllEntities = readint(cfg.get("SkyGfx", "shadowAllEntities", ""), 0);
 	c->doglare = readint(cfg.get("SkyGfx", "sunGlare", ""), -1);
 	if(c->doglare < 0){
 		iCanHasSunGlare = false;
