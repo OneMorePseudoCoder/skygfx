@@ -1645,7 +1645,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30d) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30e) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1677,6 +1677,26 @@ static int sfxHDRon;		// active for this frame's scale window
 static int sfxHDRw, sfxHDRh;
 static int sfxHDRfailed;	// CreateTexture rejected the format
 static int sfxHDRresolve(RwRaster *camR);
+// v9.30e: the sky. SA has NO colour clear for the main camera (log
+// "Zc f=6" - depth+stencil only): the gradient, clouds, stars and moon
+// are drawn by CClouds::Render (0x713950), which Idle (0x53E920) calls
+// after the camera update opens but BEFORE RenderScene (its call sits
+// at 0x53EABF) while the back buffer is still the target - outside the
+// FP16 scene window. Vanilla keeps those pixels because nothing ever
+// wipes the back buffer; our resolve stretches the FP16 frame over the
+// full screen and erases them (v9.30b ghosted with the stale sky,
+// v9.30d cleared it to flat black). So the sky pass is intercepted and
+// drawn into the FP16 buffer, and the scene window skips its own clear
+// that frame. Install is self-verifying: Idle is scanned for the E8
+// that targets 0x713950, the rel32 swap is read back - if the scan
+// finds nothing the game code stays untouched and the log says so.
+static int sfxSkyInFP16;		// sky captured into fp16 this frame
+static unsigned int sfxCCloudsRender = 0x713950;
+static int sfxSkyLog;
+static void sfxHDRclearFull(void);
+static void sfxSkyRenderWrap(void);
+static void sfxSkyInstall(void);
+static void sfxRTwriteRel32(unsigned int site, unsigned int newTarget);
 
 static void
 sfxHDRrelease(void)
@@ -1928,6 +1948,8 @@ sfxScaleInstallVtableHook(void)
 		(unsigned int)(void*)sfxClearHook);
 	sfxScaleVtPatched = 1;
 	sfxScaleVtTried = 1;
+	// v9.30e: route the sky pass into the FP16 buffer (one-time)
+	sfxSkyInstall();
 }
 
 // ---------------------------------------------------------------------------
@@ -2120,6 +2142,17 @@ sfxRTwriteByte(unsigned int addr, unsigned char b)
 	VirtualProtect((void*)addr, 1, old, &old);
 }
 
+// v9.30e: rewrite the rel32 operand of a direct E8 call (the caller
+// does the readback, same discipline as the literal byte patches)
+static void
+sfxRTwriteRel32(unsigned int site, unsigned int newTarget)
+{
+	DWORD old;
+	VirtualProtect((void*)(site + 1), 4, PAGE_EXECUTE_READWRITE, &old);
+	*(unsigned int*)(site + 1) = newTarget - (site + 5);
+	VirtualProtect((void*)(site + 1), 4, old, &old);
+}
+
 // collect the addresses of "E8 call target" inside the given range
 static int
 sfxRTfindCalls(unsigned int start, unsigned int end, unsigned int target,
@@ -2303,6 +2336,67 @@ rtshadowhooks(void)
 	sfxLogLine("install: rtshadow ok res=%d blur=%d soft=%d (literal patch, readback verified)\n", res, blurPow, soft);
 }
 
+// v9.30e: bind FP16 as target 0 (the depth stencil stays bound, same
+// recipe as sfxHDRbind) and clear it over the FULL raster rect - Clear
+// honours the viewport - then put the previous viewport back. Used by
+// the sky wrapper (before the scene window exists) and by the scene
+// window hook whenever the sky pass did not run this frame.
+static void
+sfxHDRclearFull(void)
+{
+	struct SfxD3DViewport cur;
+	struct SfxD3DViewport full = {0, 0, (unsigned int)sfxHDRw, (unsigned int)sfxHDRh, 0.0f, 1.0f};
+	memset(&cur, 0, sizeof(cur));
+	if(d3dGetViewport(d3d9device, &cur) != 0)
+		memset(&cur, 0, sizeof(cur));	// unknown - do not restore garbage
+	d3dSetViewportOrig(d3d9device, &full);
+	d3d9device->Clear(0, nil, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
+	if(cur.width)
+		d3dSetViewportOrig(d3d9device, &cur);
+}
+
+// v9.30e: the intercepted Idle call to CClouds::Render. With hdrBuffer
+// active the sky gradient, clouds, stars and moon are drawn into the
+// FP16 buffer (already cleared over the full rect), the flag tells the
+// scene window to skip its own clear, and FP16 stays bound -
+// RenderScale_Begin re-binds (idempotent) and carries on.
+static void
+sfxSkyRenderWrap(void)
+{
+	if(config->hdrBuffer && sfxHDRtex != nil && !sfxHDRfailed
+			&& d3d9device != nil){
+		sfxHDRon = 1;
+		sfxHDRbind();
+		sfxHDRclearFull();
+		sfxSkyInFP16 = 1;
+		if(sfxSkyLog++ < 8)
+			sfxLogLine("SKY render -> fp16 (captured + cleared)\n");
+	}
+	((void (*)(void))sfxCCloudsRender)();
+}
+
+// v9.30e: find Idle's direct call to CClouds::Render (between Idle
+// entry 0x53E920 and the RenderScene call at 0x53EABF) and swap the
+// target to the wrapper. Readback = re-scan for calls into the wrap.
+static void
+sfxSkyInstall(void)
+{
+	unsigned int sites[4];
+	int n;
+	n = sfxRTfindCalls(0x53E920, 0x53EABF, sfxCCloudsRender, sites, 4);
+	if(n <= 0){
+		sfxLogLine("SKY hook: call to CClouds::Render NOT FOUND in Idle - sky stays wiped, report this log\n");
+		sfxRTdump("Idle", 0x53E920, 0x53EAC8);
+		return;
+	}
+	for(int i = 0; i < n; i++)
+		sfxRTwriteRel32(sites[i], (unsigned int)sfxSkyRenderWrap);
+	if(sfxRTfindCalls(0x53E920, 0x53EABF, (unsigned int)sfxSkyRenderWrap, sites, 4) == n)
+		sfxLogLine("SKY hook: ok - %d Idle call site(s) -> CClouds::Render wrap (readback verified)\n", n);
+	else
+		sfxLogLine("SKY hook: patch did not take - report this log\n");
+}
+
 void
 RenderScale_Begin(void)
 {
@@ -2353,24 +2447,27 @@ RenderScale_Begin(void)
 		if(sfxHDRensure(camR->width, camR->height)){
 			sfxHDRon = 1;
 			sfxHDRbind();
-			// v9.30d THE actual ghosting fix: nothing clears the FP16
-			// target - the game's main camera only clears depth and
-			// relies on the sky covering the view, so there is no
-			// colour clear our hook could redirect. Clear it once per
-			// frame here, with the FULL viewport (Clear honours the
-			// viewport rect), then back to the scaled one.
-			{
-				struct SfxD3DViewport fvp = {0, 0, (unsigned int)camR->width, (unsigned int)camR->height, 0.0f, 1.0f};
-				d3dSetViewportOrig(d3d9device, &fvp);
-				d3d9device->Clear(0, nil, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
-				d3dSetViewportOrig(d3d9device, &vp);
+			// v9.30e: the sky pass (CClouds::Render, called by Idle
+			// before RenderScene) already cleared AND captured itself
+			// into the FP16 buffer this frame - wiping here again is
+			// what ate the sky in v9.30d. Only clear when the sky did
+			// not run this frame (interiors, cameras without sky),
+			// still over the FULL viewport since Clear honours it.
+			if(sfxSkyInFP16){
+				sfxSkyInFP16 = 0;
+				if(sfxSkyLog++ < 8)
+					sfxLogLine("H clear skipped - sky already in fp16\n");
+			}else{
+				sfxHDRclearFull();
 				if(sfxLogH++ < 8)
-					sfxLogLine("H clear fp16\n");
+					sfxLogLine("H clear fp16 (no sky this frame)\n");
 			}
 			if(sfxLogH++ < 8)
 				sfxLogLine("H begin: scene window -> fp16 %dx%d\n", sfxHDRw, sfxHDRh);
-		}else
+		}else{
+			sfxSkyInFP16 = 0;
 			sfxLogLine("H begin: fp16 unavailable - stock path\n");
+		}
 	}
 	if(sfxLogB++ < 40)
 		sfxLogLine("B begin: scale=%.2f raster=%ux%u vp=%ux%u -> force %dx%d\n",
@@ -2641,6 +2738,7 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->SetRenderState(D3DRS_CULLMODE, oldCull);
 	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, oldBlend);
 	sfxHDRon = 0;
+	sfxSkyInFP16 = 0;	// v9.30e: the sky flag is per frame
 	RwCameraBeginUpdate(Scene.camera);
 	if(sfxLogR++ < 40)
 		sfxLogLine("H2 resolve fp16 %ux%u -> %ux%u @coronas\n",
