@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.25) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.26) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1914,7 +1914,7 @@ sfxW2Dinstall(void)
 }
 
 // ------------------------------------------------------------------
-// v9.24: real-time shadow upgrade (opt-in, hardened single-site patch)
+// v9.26: real-time shadow upgrade (opt-in, hardened single-site patch)
 //
 // History: v9.21 (entry trampolines) crashed inside
 // CRealTimeShadow::Create. v9.22 required a push DIRECTLY in front of
@@ -1943,6 +1943,16 @@ sfxW2Dinstall(void)
 // treated as experimental (three crashes on three designs point at
 // the environment, not the idea - the new logging will tell).
 // shadowSoftness and shadowAllEntities stay reserved (unused).
+// v9.26: ROOT CAUSE OF EVERY CRASH SINCE v9.22 FOUND - it was our own
+// write, not the environment. sfxRTfindPush7 returns the address of
+// the 0x6A OPCODE byte, but the value was written to that same
+// address instead of the immediate at p+1: "push 7" (6A 07) turned
+// into "or [edi], al" (08 07 with res 8), the argument push vanished
+// and CShadowCamera::Create was called with a stale stack argument.
+// res = 7 never wrote anything, which is why it was always stable,
+// and any other value always crashed the same way everywhere. The
+// write now targets p+1 and is gated by an explicit 6A 07 check so a
+// wrong site aborts instead of corrupting the instruction stream.
 // ------------------------------------------------------------------
 static unsigned int sfxShadowCamCreateAddr = 0x705B60;	// CShadowCamera::Create(int)
 static unsigned char sfxRTShadowApplied;
@@ -2029,6 +2039,15 @@ rtshadowhooks(void)
 	sfxRTdump("Create", 0x706460, 0x706520);
 	sfxRTdump("Init", 0x7067C0, 0x706870);
 	sfxRTdump("CamCreate", 0x705B60, 0x705B80);
+	sfxRTdump("CamDtor", 0x705990, 0x705A20);
+	sfxRTdump("CamCreate2", 0x705B80, 0x705C80);
+	sfxRTdump("Gap520", 0x706520, 0x7067C0);
+	sfxRTdump("ReInit+DoShadow", 0x706870, 0x706D40);
+	sfxRTdump("HelperLight", 0x751A90, 0x751AD0);
+	sfxRTdump("HelperFirst", 0x752110, 0x752150);
+	sfxRTdump("RasterFn", 0x7EE4F0, 0x7EE550);
+	sfxRTdump("LightFn", 0x7F0410, 0x7F0430);
+	sfxRTdump("CopyFn", 0x804EF0, 0x804F10);
 	if(res < 6) res = 6;
 	if(res > 10) res = 10;
 
@@ -2046,6 +2065,10 @@ rtshadowhooks(void)
 		sfxLogLine("install: rtshadow ABORT - push 7 not found (hardened window, call@%08x)\n", calls[0]);
 		return;
 	}
+	if(((unsigned char*)p)[0] != 0x6A || ((unsigned char*)p)[1] != 0x07){
+		sfxLogLine("install: rtshadow ABORT - site is not 6A 07 @%08x\n", p);
+		return;
+	}
 	if(res == 7){
 		sfxLogLine("install: rtshadow ok res=7 (vanilla - nothing patched, push@%08x dist=%d)\n",
 			p, (int)(calls[0] - p));
@@ -2053,8 +2076,8 @@ rtshadowhooks(void)
 	}
 	sfxLogLine("install: rtshadow EXPERIMENTAL res=%d push@%08x call@%08x dist=%d\n",
 		res, p, calls[0], (int)(calls[0] - p));
-	sfxRTwriteByte(p, (unsigned char)res);
-	sfxLogLine("RT shadow: push 7 -> %d @%08x (dist %d)\n", res, p, (int)(calls[0] - p));
+	sfxRTwriteByte(p + 1, (unsigned char)res);	// v9.26 FIX: the immediate, not the opcode
+	sfxLogLine("RT shadow: push 7 -> %d @%08x imm@%08x (dist %d)\n", res, p, p + 1, (int)(calls[0] - p));
 	sfxLogLine("install: rtshadow ok res=%d soft=vanilla (single-site literal patch, 1 byte)\n", res);
 }
 
