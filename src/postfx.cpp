@@ -1621,82 +1621,19 @@ static int sfxW2DNoClear;
 static int sfxW2DZStripped;
 static int sfxLogZ, sfxLogZ0, sfxLogDS;
 static int sfxLogQ;
-// v9.16: software occlusion for coronas. CCoronas::Render draws coronas
-// NOT flagged LOSCHECK_ON with hardware z-testing only, and that path
-// bleeds through geometry when the scene is rendered at a smaller scale.
-// The game's own software occlusion (the LOSCHECK path in
-// CRegisteredCorona::Update, CWorld::GetIsLineOfSightClear) does not
-// depend on the depth buffer at all - so run the same check at render
-// start and zero FadedIntensity of occluded coronas for this frame.
-// CCoronas::Render skips coronas with FadedIntensity == 0, and the game
-// update refills the intensity natively afterwards (they fade back in
-// when renderScale is turned off - no state to restore).
-// CRegisteredCorona (SA 1.0 US): stride 0x3C, m_dwId @0x0C (0 = free),
-// m_vPosn @0x00, m_FadedIntensity @0x30. Array: 0xC3E058, 64 entries.
-// Setting the flag from the render hooks cannot work: RegisterCorona
-// rewrites it during the game process, which runs before the render.
-typedef unsigned char (__cdecl *sfxLosClearFn)(const void *from, const void *to,
-	int buildings, int vehicles, int peds, int objects, int dummies,
-	int seeThrough, int camIgnore);
-static sfxLosClearFn sfxLosClear = (sfxLosClearFn)0x56A490; // CWorld::GetIsLineOfSightClear
-static int sfxLogL;
-static int sfxLogD, sfxLogB, sfxLogR;
-// v9.17: the documented corona array (0xC3E058, stride 0x3C, id @0x0C,
-// intensity @0x30 - confirmed by BOTH plugin-sdk VALIDATE_OFFSETs and
-// gta-reversed StaticRef) reads as all zeros on this machine while
-// coronas are on screen, so the array is now located by content at
-// runtime, once, in this order:
-//   1. the documented base with layout A (above) and layout B
-//      (CPlaceable-style: posn @0x04, id @0x10, texture @0x14,
-//      intensity @0x34, stride 0x40),
-//   2. a plugin-sdk-style pointer to the array stored at 0xC3E058,
-//   3. a one-shot scan of the statics region 0x8D0000-0xC60000 for a
-//      run of 6+ plausible slots (sane position floats, id set, sane
-//      texture pointer); multiple well-separated hits are only logged.
-// Adopted parameters are cached for the rest of the session.
-static unsigned int sfxCorBase;
-static int sfxCorStride, sfxCorPosnOff, sfxCorIdOff, sfxCorTexOff;
-static int sfxCorFadeOff, sfxCorScanned, sfxCorFound;
-
-static int
-sfxCorPlaus(unsigned int b, int po, int io, int to)
-	{
-	float *pf = (float*)(b + po);
-	unsigned int id = *(unsigned int*)(b + io);
-	unsigned int tex = *(unsigned int*)(b + to);
-	if(id == 0 || pf[0] < -4000.0f || pf[0] > 4000.0f ||
-	   pf[1] < -4000.0f || pf[1] > 4000.0f ||
-	   pf[2] < -500.0f || pf[2] > 2000.0f)
-		return 0;
-	if(tex != 0 && (tex < 0x10000 || tex >= 0x20000000))
-		return 0;
-	return 1;
-}
-
-static int
-sfxCorCount(unsigned int b, int stride, int po, int io, int to)
-	{
-	int ci, n = 0;
-	for(ci = 0; ci < 64; ci++)
-		n += sfxCorPlaus(b + ci*stride, po, io, to);
-	return n;
-}
-
-static int
-sfxCorTry(unsigned int b, int stride, int po, int io, int to, int fo)
-	{
-	int n = sfxCorCount(b, stride, po, io, to);
-	if(n >= 6)	{
-		sfxCorBase = b;
-		sfxCorStride = stride;
-		sfxCorPosnOff = po;
-		sfxCorIdOff = io;
-		sfxCorTexOff = to;
-		sfxCorFadeOff = fo;
-		return n;
-	}
-	return 0;
-}
+static int sfxLogB, sfxLogR;
+// v9.19: the end-of-frame stretch is deferred out of RenderScale_EndOfScene
+// into the swallowed CCoronas::Render stub - see the long note in
+// RenderScale_EndOfScene. While sfxStretchPending is set the scale window
+// (scaled viewport, shrunk RsGlobal and camera raster) stays open, so the
+// world-space draws of RenderEffects - above all CMovingThings::Render,
+// which is where Project2DFX renders its LOD lights - land in the sub-rect
+// and z-test against the intact sub-rect depth instead of against the
+// misaligned full-viewport depth the old immediate stretch left behind.
+static int sfxStretchPending;
+static RwRaster *sfxSavedFB;
+static DWORD sfxSavedRsW, sfxSavedRsH;
+static void RenderScale_DeferredStretch(void);
 static void
 sfxLogLine(const char *fmt, ...)
 {
@@ -1706,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.17) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.19) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1938,7 +1875,7 @@ sfxW2DcallOrig(int i)
 	sfxW2Dwrite(i, sfxW2Dhooks[i].jmp);
 }
 
-static void sfxW2Dcoronas(void){ if(!sfxWorld2DDrawn) sfxW2DcallOrig(0); }
+static void sfxW2Dcoronas(void){ if(sfxStretchPending) RenderScale_DeferredStretch(); if(!sfxWorld2DDrawn) sfxW2DcallOrig(0); }
 static void sfxW2Dbright(void){ if(!sfxWorld2DDrawn) sfxW2DcallOrig(1); }
 static void sfxW2Dshiny(void){ if(!sfxWorld2DDrawn) sfxW2DcallOrig(2); }
 static void sfxW2Dmarkers(void){ if(!sfxWorld2DDrawn) sfxW2DcallOrig(3); }
@@ -2021,94 +1958,6 @@ RenderScale_Begin(void)
 	d3dSetViewportOrig(d3d9device, &vp);
 	sfxVpScaled = 1;
 	sfxScaleInScene = 1;
-	// v9.17: show what actually lives at the documented address
-	if(sfxLogD++ < 2){
-		unsigned int *u = (unsigned int*)0xC3E058;
-		sfxLogLine("D num=%u ptr=%08x\n", *(unsigned int*)0xC3E038, u[0]);
-		sfxLogLine("D0 %08x %08x %08x %08x %08x %08x %08x %08x\n", u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]);
-		sfxLogLine("D1 %08x %08x %08x %08x %08x %08x %08x %08x\n", u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
-		sfxLogLine("D2 %08x %08x %08x %08x %08x %08x %08x %08x\n", u[16], u[17], u[18], u[19], u[20], u[21], u[22], u[23]);
-		sfxLogLine("D3 %08x %08x %08x %08x %08x %08x %08x %08x\n", u[24], u[25], u[26], u[27], u[28], u[29], u[30], u[31]);
-	}
-	// v9.17: locate the corona array by content (see the note at sfxCorBase)
-	if(!sfxCorScanned){
-		unsigned int p;
-		int n;
-		sfxCorScanned = 1;
-		n = sfxCorTry(0xC3E058, 0x3C, 0x00, 0x0C, 0x10, 0x30);
-		if(n){
-			sfxCorFound = 1;
-			sfxLogLine("S found base=0xC3E058 layout=A n=%d\n", n);
-		}else{
-			n = sfxCorTry(0xC3E058, 0x40, 0x04, 0x10, 0x14, 0x34);
-			if(n){
-				sfxCorFound = 1;
-				sfxLogLine("S found base=0xC3E058 layout=B n=%d\n", n);
-			}
-		}
-		if(!sfxCorFound){
-			p = *(unsigned int*)0xC3E058;
-			if(p >= 0x10000 && p < 0x20000000){
-				n = sfxCorTry(p, 0x3C, 0x00, 0x0C, 0x10, 0x30);
-				if(n == 0)
-					n = sfxCorTry(p, 0x40, 0x04, 0x10, 0x14, 0x34);
-				if(n){
-					sfxCorFound = 1;
-					sfxLogLine("S found ptr=%08x n=%d\n", p, n);
-				}
-			}
-		}
-		if(!sfxCorFound){
-			unsigned int b;
-			unsigned int cb[6];
-			int cl[6], nc = 0, k;
-			for(b = 0x8D0000; b < 0xC60000 && nc < 6; b += 4){
-				int lay = -1;
-				if(sfxCorCount(b, 0x3C, 0x00, 0x0C, 0x10) >= 6)
-					lay = 0;
-				else if(sfxCorCount(b, 0x40, 0x04, 0x10, 0x14) >= 6)
-					lay = 1;
-				if(lay >= 0 && (nc == 0 || b - cb[nc-1] > 0x100)){
-					cb[nc] = b;
-					cl[nc] = lay;
-					nc++;
-				}
-			}
-			if(nc == 1){
-				sfxCorFound = 1;
-				n = sfxCorTry(cb[0], cl[0] ? 0x40 : 0x3C,
-					cl[0] ? 0x04 : 0x00, cl[0] ? 0x10 : 0x0C,
-					cl[0] ? 0x14 : 0x10, cl[0] ? 0x34 : 0x30);
-				sfxLogLine("S scanned: unique base=%08x layout=%c n=%d\n",
-					cb[0], cl[0] ? 'B' : 'A', n);
-			}else if(nc == 0){
-				sfxLogLine("S scanned: no candidate\n");
-			}else{
-				for(k = 0; k < nc; k++)
-					sfxLogLine("S cand[%d] base=%08x layout=%c\n",
-						k, cb[k], cl[k] ? 'B' : 'A');
-			}
-		}
-	}
-	// v9.16/17: hide coronas occluded by geometry (see the note at sfxLosClear)
-	if(sfxCorFound){
-		int ci, nchecked = 0, nhidden = 0;
-		RwV3d campos = RwFrameGetMatrix(RwCameraGetFrame(Scene.camera))->pos;
-		for(ci = 0; ci < 64; ci++){
-			unsigned char *e = (unsigned char*)(sfxCorBase + ci*sfxCorStride);
-			if(*(unsigned int*)(void*)(e + sfxCorIdOff) == 0 || e[sfxCorFadeOff] == 0)
-				continue;
-			nchecked++;
-			if(!sfxLosClear((const void*)(e + sfxCorPosnOff), (const void*)&campos, 1, 0, 0, 0, 0, 0, 0)){
-				e[sfxCorFadeOff] = 0; // blocked - renderer skips it this frame
-				nhidden++;
-			}
-		}
-		if(sfxLogL++ < 10)
-			sfxLogLine("L base=%08x st=0x%x po=%d io=%d fo=%d: %d checked, %d hidden\n",
-				sfxCorBase, sfxCorStride, sfxCorPosnOff, sfxCorIdOff,
-				sfxCorFadeOff, nchecked, nhidden);
-	}
 	if(sfxLogB++ < 40)
 		sfxLogLine("B begin: scale=%.2f raster=%ux%u vp=%ux%u -> force %dx%d\n",
 			s, sfxSceneW, sfxSceneH, sfxVpFull.width, sfxVpFull.height, w, h);
@@ -2186,9 +2035,9 @@ RenderScale_EndOfScene(void)
 	if(sfxW2Dinstalled
 		&& ensureW2DDimsRaster(sfxScaleW, sfxScaleH, camR->depth)){
 		int i, n = 0;
-		RwRaster *savedFB = Scene.camera->frameBuffer;
-		DWORD savedRsW = RsGlobal->MaximumWidth;
-		DWORD savedRsH = RsGlobal->MaximumHeight;
+		sfxSavedFB = Scene.camera->frameBuffer;
+		sfxSavedRsW = RsGlobal->MaximumWidth;
+		sfxSavedRsH = RsGlobal->MaximumHeight;
 		// pipeline/Im3D draws follow the viewport
 		struct SfxD3DViewport svp = {0, 0, (unsigned int)sfxScaleW, (unsigned int)sfxScaleH, 0.0f, 1.0f};
 		d3dSetViewportOrig(d3d9device, &svp);
@@ -2226,11 +2075,6 @@ RenderScale_EndOfScene(void)
 				if(i > 0)
 					RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
 				((sfxVoidCall)sfxW2Dhooks[i].addr)();
-				if(sfxLogQ++ < 8){
-					void *zv = nil;
-					RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &zv);
-					sfxLogLine("O %d zAfter=%d\n", i, (int)(unsigned long)zv);
-				}
 				n++;
 			}
 		}
@@ -2241,24 +2085,28 @@ RenderScale_EndOfScene(void)
 			d3d9device->SetRenderState(D3DRS_ZFUNC, oldZfn);
 		}
 		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, oldRwZTest);
-		sfxScaleInScene = 0;
-		sfxScaleActive = 0;
-		// everything back to normal before any further RW context call
-		RsGlobal->MaximumWidth = savedRsW;
-		RsGlobal->MaximumHeight = savedRsH;
-		Scene.camera->frameBuffer = savedFB;
-		struct SfxD3DViewport fullvp = {0, 0, (unsigned int)camR->width, (unsigned int)camR->height, 0.0f, 1.0f};
-		d3dSetViewportOrig(d3d9device, &fullvp);
-		{ void *ds2 = nil;
-		  if(d3dGetDepthStencil)
-			d3dGetDepthStencil(d3d9device, &ds2);
-		  if(n > 0 && sfxW2Dlogs < 8){
+		// v9.19: keep the scale window open through RenderEffects. The
+		// game draws world-space overlays AFTER RenderScene returns
+		// (skidmarks, glass, CMovingThings::Render - which is where
+		// Project2DFX renders its LOD lights - really-draw-last
+		// entities, fx). With the old immediate stretch those draws ran
+		// at the full viewport against the sub-rect-only depth buffer:
+		// colour and depth were misaligned and the lights z-tested
+		// against the wrong pixels - the "coronas bleed through walls"
+		// bug. The stretch is now done by the swallowed CCoronas::Render
+		// stub, which RenderEffects calls right after
+		// CMovingThings::Render, so those draws happen INSIDE the
+		// window: the scaled viewport and the shrunk RsGlobal/raster put
+		// their coordinates in the sub-rect and the intact sub-rect
+		// depth occludes them correctly.
+		sfxScaleInScene = 1;
+		sfxScaleActive = 1;
+		sfxStretchPending = 1;
+		if(n > 0 && sfxW2Dlogs < 8){
 			sfxW2Dlogs++;
-			sfxLogLine("M world2d: %d overlays, dims %dx%d vpfix %d zstrip %d z was %d f %d wr %d ds=%08x\n",
-				n, sfxScaleW, sfxScaleH, sfxW2DVpFix, sfxW2DZStripped,
-				oldZen, oldZfn, oldZwr, (unsigned int)ds2);
-		  }
+			sfxLogLine("M world2d: %d overlays - window open for RenderEffects\n", n);
 		}
+		return;
 	}else
 		sfxW2DNoClear = 0;
 	// 1:1 copy of the frame into the scratch raster (the camera raster is
@@ -2303,12 +2151,82 @@ RenderScale_EndOfScene(void)
 			sfxScaleW, sfxScaleH, camR->width, camR->height);
 }
 
+// v9.19: the deferred end-of-frame stretch. Runs from the swallowed
+// CCoronas::Render stub inside RenderEffects - after CMovingThings::Render
+// (Project2DFX LOD lights) and before the fx/HUD draws that need the full
+// raster - and also from DrawFinalEffects as a safety net.
+static void
+RenderScale_DeferredStretch(void)
+{
+	RwRaster *camR;
+	sfxStretchPending = 0;
+	camR = RwCameraGetRaster(Scene.camera);
+	if(camR != nil && (sfxStretchRaster != nil
+			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
+		// full viewport first - the stretch quad is placed in
+		// full-raster coordinates
+		struct SfxD3DViewport fullvp = {0, 0, (unsigned int)camR->width, (unsigned int)camR->height, 0.0f, 1.0f};
+		if(d3dSetViewportOrig)
+			d3dSetViewportOrig(d3d9device, &fullvp);
+		sfxVpScaled = 0;
+		sfxScaleActive = 0;
+		sfxScaleInScene = 0;
+		RwCameraEndUpdate(Scene.camera);
+		RwRasterPushContext(sfxStretchRaster);
+		RwRasterRenderFast(camR, 0, 0);
+		RwRasterPopContext();
+		RwCameraBeginUpdate(Scene.camera);
+		{
+			static RwIm2DVertex sv[4];
+			float nearscreen = RwIm2DGetNearScreenZ();
+			float nearcam = RwCameraGetNearClipPlane(Scene.camera);
+			float recipz = 1.0f/nearcam;
+			quadSetUV(sv, 0.0f, 0.0f,
+				(float)sfxScaleW/(float)camR->width,
+				(float)sfxScaleH/(float)camR->height);
+			quadSetXY(sv, 0.0f, 0.0f, (float)camR->width, (float)camR->height);
+			for(int i = 0; i < 4; i++){
+				RwIm2DVertexSetScreenZ(&sv[i], nearscreen);
+				RwIm2DVertexSetCameraZ(&sv[i], nearcam);
+				RwIm2DVertexSetRecipCameraZ(&sv[i], recipz);
+				RwIm2DVertexSetIntRGBA(&sv[i], 255, 255, 255, 255);
+			}
+			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
+			RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+			RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+			RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+			RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)sfxStretchRaster);
+			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, sv, 4, colorfilterIndices, 6);
+			RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)NULL);
+			RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
+			RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+		}
+		if(sfxLogR++ < 40)
+			sfxLogLine("R2 stretch %ux%u -> %ux%u @coronas\n",
+				sfxScaleW, sfxScaleH, camR->width, camR->height);
+	}else
+		sfxLogLine("R2 no stretch (raster/scratch)\n");
+	// window fully closed - normal screen and raster sizes back
+	RsGlobal->MaximumWidth = sfxSavedRsW;
+	RsGlobal->MaximumHeight = sfxSavedRsH;
+	Scene.camera->frameBuffer = sfxSavedFB;
+	sfxW2DNoClear = 0;
+}
+
 void
 CPostEffects::DrawFinalEffects(void)
 {
 	// safety: make sure the scale window is closed and the full viewport is
 	// back - RenderScale_EndOfScene normally did both (and stretched the
 	// frame already); this only fires on odd frames that skip it
+	// v9.19: safety - if the coronas stub never ran this frame, do the
+	// deferred stretch here (the window is still open at this point)
+	if(sfxStretchPending)
+		RenderScale_DeferredStretch();
 	if(sfxScaleActive){
 		sfxScaleActive = 0;
 		if(sfxVpScaled && sfxVpFull.width != 0 && d3dSetViewportOrig){
@@ -2331,8 +2249,9 @@ CPostEffects::DrawFinalEffects(void)
 	float grainStrength = config->ps2GrainStrength;
 	bool doAutoExp = config->doAutoExposure != 0;
 
-	// renderScale: the frame was already stretched to full size in
-	// RenderScale_EndOfScene (before the game drew its HUD), so this
+	// renderScale: the frame was already stretched to full size by the
+	// deferred stretch (RenderScale_DeferredStretch, before the game
+	// drew its HUD), so this
 	// function needs no scale-specific handling - it just runs the normal
 	// post-FX chain on the finished frame
 
