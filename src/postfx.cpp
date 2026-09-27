@@ -1644,7 +1644,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1706,7 +1706,7 @@ sfxHDRensure(int w, int h)
 		sfxHDRfailed = 1;
 		return 0;
 	}
-	sfxHDRtex->GetSurfaceLevel(0, (IDirect3DSurface9**)&sfxHDRsurf);
+	((IDirect3DTexture9*)sfxHDRtex)->GetSurfaceLevel(0, (IDirect3DSurface9**)&sfxHDRsurf);
 	if(sfxHDRsurf == nil){
 		sfxLogLine("HDR: GetSurfaceLevel failed - feature off\n");
 		sfxHDRrelease();
