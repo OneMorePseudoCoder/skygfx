@@ -1640,6 +1640,63 @@ typedef unsigned char (__cdecl *sfxLosClearFn)(const void *from, const void *to,
 	int seeThrough, int camIgnore);
 static sfxLosClearFn sfxLosClear = (sfxLosClearFn)0x56A490; // CWorld::GetIsLineOfSightClear
 static int sfxLogL;
+static int sfxLogD, sfxLogB, sfxLogR;
+// v9.17: the documented corona array (0xC3E058, stride 0x3C, id @0x0C,
+// intensity @0x30 - confirmed by BOTH plugin-sdk VALIDATE_OFFSETs and
+// gta-reversed StaticRef) reads as all zeros on this machine while
+// coronas are on screen, so the array is now located by content at
+// runtime, once, in this order:
+//   1. the documented base with layout A (above) and layout B
+//      (CPlaceable-style: posn @0x04, id @0x10, texture @0x14,
+//      intensity @0x34, stride 0x40),
+//   2. a plugin-sdk-style pointer to the array stored at 0xC3E058,
+//   3. a one-shot scan of the statics region 0x8D0000-0xC60000 for a
+//      run of 6+ plausible slots (sane position floats, id set, sane
+//      texture pointer); multiple well-separated hits are only logged.
+// Adopted parameters are cached for the rest of the session.
+static unsigned int sfxCorBase;
+static int sfxCorStride, sfxCorPosnOff, sfxCorIdOff, sfxCorTexOff;
+static int sfxCorFadeOff, sfxCorScanned, sfxCorFound;
+
+static int
+sfxCorPlaus(unsigned int b, int po, int io, int to)
+	{
+	float *pf = (float*)(b + po);
+	unsigned int id = *(unsigned int*)(b + io);
+	unsigned int tex = *(unsigned int*)(b + to);
+	if(id == 0 || pf[0] < -4000.0f || pf[0] > 4000.0f ||
+	   pf[1] < -4000.0f || pf[1] > 4000.0f ||
+	   pf[2] < -500.0f || pf[2] > 2000.0f)
+		return 0;
+	if(tex != 0 && (tex < 0x10000 || tex >= 0x20000000))
+		return 0;
+	return 1;
+}
+
+static int
+sfxCorCount(unsigned int b, int stride, int po, int io, int to)
+	{
+	int ci, n = 0;
+	for(ci = 0; ci < 64; ci++)
+		n += sfxCorPlaus(b + ci*stride, po, io, to);
+	return n;
+}
+
+static int
+sfxCorTry(unsigned int b, int stride, int po, int io, int to, int fo)
+	{
+	int n = sfxCorCount(b, stride, po, io, to);
+	if(n >= 6)	{
+		sfxCorBase = b;
+		sfxCorStride = stride;
+		sfxCorPosnOff = po;
+		sfxCorIdOff = io;
+		sfxCorTexOff = to;
+		sfxCorFadeOff = fo;
+		return n;
+	}
+	return 0;
+}
 static void
 sfxLogLine(const char *fmt, ...)
 {
@@ -1649,7 +1706,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.16) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.17) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1964,26 +2021,97 @@ RenderScale_Begin(void)
 	d3dSetViewportOrig(d3d9device, &vp);
 	sfxVpScaled = 1;
 	sfxScaleInScene = 1;
-	// v9.16: hide coronas occluded by geometry (see the note at sfxLosClear)
-	{
+	// v9.17: show what actually lives at the documented address
+	if(sfxLogD++ < 2){
+		unsigned int *u = (unsigned int*)0xC3E058;
+		sfxLogLine("D num=%u ptr=%08x\n", *(unsigned int*)0xC3E038, u[0]);
+		sfxLogLine("D0 %08x %08x %08x %08x %08x %08x %08x %08x\n", u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]);
+		sfxLogLine("D1 %08x %08x %08x %08x %08x %08x %08x %08x\n", u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+		sfxLogLine("D2 %08x %08x %08x %08x %08x %08x %08x %08x\n", u[16], u[17], u[18], u[19], u[20], u[21], u[22], u[23]);
+		sfxLogLine("D3 %08x %08x %08x %08x %08x %08x %08x %08x\n", u[24], u[25], u[26], u[27], u[28], u[29], u[30], u[31]);
+	}
+	// v9.17: locate the corona array by content (see the note at sfxCorBase)
+	if(!sfxCorScanned){
+		unsigned int p;
+		int n;
+		sfxCorScanned = 1;
+		n = sfxCorTry(0xC3E058, 0x3C, 0x00, 0x0C, 0x10, 0x30);
+		if(n){
+			sfxCorFound = 1;
+			sfxLogLine("S found base=0xC3E058 layout=A n=%d\n", n);
+		}else{
+			n = sfxCorTry(0xC3E058, 0x40, 0x04, 0x10, 0x14, 0x34);
+			if(n){
+				sfxCorFound = 1;
+				sfxLogLine("S found base=0xC3E058 layout=B n=%d\n", n);
+			}
+		}
+		if(!sfxCorFound){
+			p = *(unsigned int*)0xC3E058;
+			if(p >= 0x10000 && p < 0x20000000){
+				n = sfxCorTry(p, 0x3C, 0x00, 0x0C, 0x10, 0x30);
+				if(n == 0)
+					n = sfxCorTry(p, 0x40, 0x04, 0x10, 0x14, 0x34);
+				if(n){
+					sfxCorFound = 1;
+					sfxLogLine("S found ptr=%08x n=%d\n", p, n);
+				}
+			}
+		}
+		if(!sfxCorFound){
+			unsigned int b;
+			unsigned int cb[6];
+			int cl[6], nc = 0, k;
+			for(b = 0x8D0000; b < 0xC60000 && nc < 6; b += 4){
+				int lay = -1;
+				if(sfxCorCount(b, 0x3C, 0x00, 0x0C, 0x10) >= 6)
+					lay = 0;
+				else if(sfxCorCount(b, 0x40, 0x04, 0x10, 0x14) >= 6)
+					lay = 1;
+				if(lay >= 0 && (nc == 0 || b - cb[nc-1] > 0x100)){
+					cb[nc] = b;
+					cl[nc] = lay;
+					nc++;
+				}
+			}
+			if(nc == 1){
+				sfxCorFound = 1;
+				n = sfxCorTry(cb[0], cl[0] ? 0x40 : 0x3C,
+					cl[0] ? 0x04 : 0x00, cl[0] ? 0x10 : 0x0C,
+					cl[0] ? 0x14 : 0x10, cl[0] ? 0x34 : 0x30);
+				sfxLogLine("S scanned: unique base=%08x layout=%c n=%d\n",
+					cb[0], cl[0] ? 'B' : 'A', n);
+			}else if(nc == 0){
+				sfxLogLine("S scanned: no candidate\n");
+			}else{
+				for(k = 0; k < nc; k++)
+					sfxLogLine("S cand[%d] base=%08x layout=%c\n",
+						k, cb[k], cl[k] ? 'B' : 'A');
+			}
+		}
+	}
+	// v9.16/17: hide coronas occluded by geometry (see the note at sfxLosClear)
+	if(sfxCorFound){
 		int ci, nchecked = 0, nhidden = 0;
 		RwV3d campos = RwFrameGetMatrix(RwCameraGetFrame(Scene.camera))->pos;
-		unsigned char *arr = (unsigned char*)0xC3E058;
 		for(ci = 0; ci < 64; ci++){
-			unsigned char *e = arr + ci*0x3C;
-			if(*(unsigned int*)(void*)(e + 0x0C) == 0 || e[0x30] == 0)
+			unsigned char *e = (unsigned char*)(sfxCorBase + ci*sfxCorStride);
+			if(*(unsigned int*)(void*)(e + sfxCorIdOff) == 0 || e[sfxCorFadeOff] == 0)
 				continue;
 			nchecked++;
-			if(!sfxLosClear((const void*)e, (const void*)&campos, 1, 0, 0, 0, 0, 0, 0)){
-				e[0x30] = 0; // blocked - renderer skips it this frame
+			if(!sfxLosClear((const void*)(e + sfxCorPosnOff), (const void*)&campos, 1, 0, 0, 0, 0, 0, 0)){
+				e[sfxCorFadeOff] = 0; // blocked - renderer skips it this frame
 				nhidden++;
 			}
 		}
-		if(sfxLogL++ < 8)
-			sfxLogLine("L los %d checked, %d hidden\n", nchecked, nhidden);
+		if(sfxLogL++ < 10)
+			sfxLogLine("L base=%08x st=0x%x po=%d io=%d fo=%d: %d checked, %d hidden\n",
+				sfxCorBase, sfxCorStride, sfxCorPosnOff, sfxCorIdOff,
+				sfxCorFadeOff, nchecked, nhidden);
 	}
-	sfxLogLine("B begin: scale=%.2f raster=%ux%u vp=%ux%u -> force %dx%d\n",
-		s, sfxSceneW, sfxSceneH, sfxVpFull.width, sfxVpFull.height, w, h);
+	if(sfxLogB++ < 40)
+		sfxLogLine("B begin: scale=%.2f raster=%ux%u vp=%ux%u -> force %dx%d\n",
+			s, sfxSceneW, sfxSceneH, sfxVpFull.width, sfxVpFull.height, w, h);
 }
 
 // full-size scratch raster for the stretch pass (same recipe as the bloom
@@ -2098,6 +2226,11 @@ RenderScale_EndOfScene(void)
 				if(i > 0)
 					RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
 				((sfxVoidCall)sfxW2Dhooks[i].addr)();
+				if(sfxLogQ++ < 8){
+					void *zv = nil;
+					RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &zv);
+					sfxLogLine("O %d zAfter=%d\n", i, (int)(unsigned long)zv);
+				}
 				n++;
 			}
 		}
@@ -2165,8 +2298,9 @@ RenderScale_EndOfScene(void)
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
 	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
 	sfxVpScaled = 0;
-	sfxLogLine("R stretch %ux%u -> %ux%u\n",
-		sfxScaleW, sfxScaleH, camR->width, camR->height);
+	if(sfxLogR++ < 40)
+		sfxLogLine("R stretch %ux%u -> %ux%u\n",
+			sfxScaleW, sfxScaleH, camR->width, camR->height);
 }
 
 void
