@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.22b) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.22c) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1914,34 +1914,41 @@ sfxW2Dinstall(void)
 }
 
 // ------------------------------------------------------------------
-// v9.22: real-time shadow upgrade (literal patch design)
+// v9.22c: real-time shadow upgrade (literal patch design)
 //
 // v9.21 hooked the entry points of CShadowCamera::Create and
 // CRealTimeShadow::Create with jump trampolines (restore 5 bytes ->
 // call original -> re-install jump) and crashed inside
 // CRealTimeShadow::Create on new game: the retail code did not
-// tolerate the trampoline around this thiscall (the crash dump shows
-// a corrupted this/argument area on the first creation from
-// CRealTimeShadowManager::Init). This build does NOT hook any
-// function entry. The shadow raster sizes and the blur pass count are
-// plain push-immediate literals at the call sites:
+// tolerate the trampoline around this thiscall - the crash dump
+// showed a corrupted this/argument area on the first creation from
+// CRealTimeShadowManager::Init. This build does NOT hook any
+// function entry. The shadow raster sizes and the blur pass count
+// are plain push-immediate literals at the call sites:
 //
 //   CRealTimeShadow::Create (0x706460):
-//       push 7; call CShadowCamera::Create  -> entity shadow raster 1<<7
-//       push 6; call CShadowCamera::Create  -> blur raster 1<<6
+//       push 7  -> entity shadow raster 1<<7
+//       push 6  -> blur raster 1<<6
 //   CRealTimeShadowManager::Init (0x7067C0):
-//       push 4; call CRealTimeShadow::Create -> blur passes (vanilla 4)
-//       push 6; call CShadowCamera::Create   -> manager blur camera
-//       push 6; call CShadowCamera::Create   -> manager gradient camera
+//       push 4  -> blur passes, arg to CRealTimeShadow::Create
+//       push 6  -> manager blur camera raster 1<<6
+//       push 6  -> manager gradient camera raster 1<<6
 //
-// So we just rewrite those immediate bytes in place (one byte per
-// site). Every patch is self-verifying: only a 6A xx push immediately
-// in front of an E8 call whose target matches is rewritten, and the
-// call sites are counted first - if the binary does not look as
-// expected nothing is patched at all (pure vanilla behaviour).
-// With shadowResolution=7 and shadowSoftness=-1 (or unset) not a
-// single byte of the game is modified.
-// shadowAllEntities is postponed (it needed a function entry hook).
+// v9.22 required a push DIRECTLY in front of the call byte and found
+// zero sites: the v9.22b log proved the call sites themselves are
+// exactly as expected (2 E8 calls to CShadowCamera::Create inside
+// CRealTimeShadow::Create, 2+1 inside Manager::Init - no ABORT was
+// logged), but MSVC puts the thiscall ECX load between the argument
+// push and the call, e.g. "6A 07 | 8B 49 08 | E8 ...". So v9.22c
+// searches a 16 byte window in front of each verified call site and
+// takes the LAST matching push (an earlier call site's own push can
+// only sit before ours in that window, so last match is the right
+// one). Everything is located and validated FIRST and the bytes are
+// only written when every single check passes - any mismatch logs
+// ABORT and leaves the game 100 percent vanilla. With
+// shadowResolution=7 and shadowSoftness=-1 (or unset) not a single
+// byte of the game is modified.
+// shadowAllEntities is postponed - it required a function entry hook.
 // ------------------------------------------------------------------
 static unsigned int sfxShadowCamCreateAddr = 0x705B60;	// CShadowCamera::Create(int)
 static unsigned int sfxRTShadowCreateAddr = 0x706460;	// CRealTimeShadow::Create
@@ -1956,41 +1963,34 @@ sfxRTwriteByte(unsigned int addr, unsigned char b)
 	VirtualProtect((void*)addr, 1, old, &old);
 }
 
-// number of "call target" sites in the given (start..end) range
+// collect the addresses of "E8 call target" inside the given range
 static int
-sfxRTcountCalls(unsigned int start, unsigned int end, unsigned int target)
+sfxRTfindCalls(unsigned int start, unsigned int end, unsigned int target,
+		unsigned int *out, int maxOut)
 {
 	unsigned int a;
 	int n = 0;
-	for(a = start; a < end - 6; a++){
+	for(a = start; a < end - 6 && n < maxOut; a++){
 		unsigned char *p = (unsigned char*)a;
 		if(p[0] == 0xE8 && (unsigned int)(a + 5 + *(int *)(p + 1)) == target)
-			n++;
+			out[n++] = a;
 	}
 	return n;
 }
 
-// rewrite every "push from; call target" in the (start..end) range to
-// "push to". Returns the number of sites patched.
-static int
-sfxRTpatchPush(unsigned int start, unsigned int end, unsigned int target,
-		unsigned char from, unsigned char to)
+// last "push from" (6A from) at or after minAddr and before callAddr;
+// returns its address or 0 if there is none
+static unsigned int
+sfxRTfindPush(unsigned int minAddr, unsigned int callAddr, unsigned char from)
 {
 	unsigned int a;
-	int n = 0;
-	for(a = start; a < end - 6; a++){
+	unsigned int found = 0;
+	for(a = minAddr; a + 1 < callAddr; a++){
 		unsigned char *p = (unsigned char*)a;
-		if(p[0] != 0xE8)
-			continue;
-		if((unsigned int)(a + 5 + *(int *)(p + 1)) != target)
-			continue;
-		if(p[-2] == 0x6A && p[-1] == from){
-			sfxRTwriteByte(a - 1, to);
-			sfxLogLine("RT shadow: push %d -> %d @%08x\n", from, to, a - 1);
-			n++;
-		}
+		if(p[0] == 0x6A && p[1] == from)
+			found = a;
 	}
-	return n;
+	return found;
 }
 
 void
@@ -1998,6 +1998,12 @@ rtshadowhooks(void)
 {
 	int res = config->shadowResolution;
 	int soft = config->shadowSoftness;
+	unsigned int calls[4];
+	unsigned int pushes[8];
+	unsigned char froms[8], tos[8];
+	unsigned int minA, p;
+	int npatch = 0;
+	int i;
 	if(sfxRTShadowApplied)
 		return;
 	sfxRTShadowApplied = 1;
@@ -2005,29 +2011,82 @@ rtshadowhooks(void)
 	if(res > 10) res = 10;
 	if(soft > 8) soft = 8;
 
-	// validate the layout first - abort to pure vanilla on mismatch
-	if(sfxRTcountCalls(0x706460, 0x706520, sfxShadowCamCreateAddr) != 2){
-		sfxLogLine("install: rtshadow ABORT - unexpected CRealTimeShadow::Create layout\n");
+	// ---- locate and validate everything first, write nothing yet ----
+	// CRealTimeShadow::Create: two CShadowCamera::Create calls
+	if(sfxRTfindCalls(0x706460, 0x706520, sfxShadowCamCreateAddr, calls, 4) != 2){
+		sfxLogLine("install: rtshadow ABORT - Create call count\n");
 		return;
 	}
-	if(sfxRTcountCalls(0x7067C0, 0x706870, sfxShadowCamCreateAddr) != 2 ||
-	   sfxRTcountCalls(0x7067C0, 0x706870, sfxRTShadowCreateAddr) != 1){
-		sfxLogLine("install: rtshadow ABORT - unexpected shadow manager Init layout\n");
+	minA = calls[0] - 16;
+	if(minA < 0x706460) minA = 0x706460;
+	p = sfxRTfindPush(minA, calls[0], 7);
+	if(p == 0){
+		sfxLogLine("install: rtshadow ABORT - push 7 not found\n");
 		return;
+	}
+	if(res != 7){
+		pushes[npatch] = p; froms[npatch] = 7; tos[npatch] = (unsigned char)res; npatch++;
+	}
+	minA = calls[1] - 16;
+	if(minA < 0x706460) minA = 0x706460;
+	p = sfxRTfindPush(minA, calls[1], 6);
+	if(p == 0){
+		sfxLogLine("install: rtshadow ABORT - push 6 blur raster not found\n");
+		return;
+	}
+	if(res - 1 != 6){
+		pushes[npatch] = p; froms[npatch] = 6; tos[npatch] = (unsigned char)(res - 1); npatch++;
 	}
 
-	if(res != 7){
-		// 1 entity shadow + 1 blur raster + 2 manager cameras = 4 sites
-		int n = 0;
-		n += sfxRTpatchPush(0x706460, 0x706520, sfxShadowCamCreateAddr, 7, res);
-		n += sfxRTpatchPush(0x706460, 0x706520, sfxShadowCamCreateAddr, 6, res - 1);
-		n += sfxRTpatchPush(0x7067C0, 0x706870, sfxShadowCamCreateAddr, 6, res - 1);
-		sfxLogLine("install: rtshadow raster sites patched %d\n", n);
+	// CRealTimeShadowManager::Init: two CShadowCamera::Create(6) calls
+	if(sfxRTfindCalls(0x7067C0, 0x706870, sfxShadowCamCreateAddr, calls, 4) != 2){
+		sfxLogLine("install: rtshadow ABORT - Init camera call count\n");
+		return;
 	}
-	if(soft >= 0 && soft != 4)
-		sfxLogLine("install: rtshadow blur sites patched %d\n",
-			sfxRTpatchPush(0x7067C0, 0x706870, sfxRTShadowCreateAddr, 4, (unsigned char)soft));
-	sfxLogLine("install: rtshadow ok res=%d soft=%d (literal patch)\n", res, soft);
+	minA = calls[0] - 16;
+	if(minA < 0x7067C0) minA = 0x7067C0;
+	p = sfxRTfindPush(minA, calls[0], 6);
+	if(p == 0){
+		sfxLogLine("install: rtshadow ABORT - push 6 manager blur not found\n");
+		return;
+	}
+	if(res - 1 != 6){
+		pushes[npatch] = p; froms[npatch] = 6; tos[npatch] = (unsigned char)(res - 1); npatch++;
+	}
+	minA = calls[1] - 16;
+	if(minA < 0x7067C0) minA = 0x7067C0;
+	p = sfxRTfindPush(minA, calls[1], 6);
+	if(p == 0){
+		sfxLogLine("install: rtshadow ABORT - push 6 manager gradient not found\n");
+		return;
+	}
+	if(res - 1 != 6){
+		pushes[npatch] = p; froms[npatch] = 6; tos[npatch] = (unsigned char)(res - 1); npatch++;
+	}
+
+	// CRealTimeShadowManager::Init: CRealTimeShadow::Create(true, 4, true)
+	if(sfxRTfindCalls(0x7067C0, 0x706870, sfxRTShadowCreateAddr, calls, 4) != 1){
+		sfxLogLine("install: rtshadow ABORT - Init create call count\n");
+		return;
+	}
+	if(soft >= 0 && soft != 4){
+		minA = calls[0] - 16;
+		if(minA < 0x7067C0) minA = 0x7067C0;
+		p = sfxRTfindPush(minA, calls[0], 4);
+		if(p == 0){
+			sfxLogLine("install: rtshadow ABORT - push 4 blur passes not found\n");
+			return;
+		}
+		pushes[npatch] = p; froms[npatch] = 4; tos[npatch] = (unsigned char)soft; npatch++;
+	}
+
+	// ---- everything validated: write the bytes ----
+	for(i = 0; i < npatch; i++){
+		sfxRTwriteByte(pushes[i], tos[i]);
+		sfxLogLine("RT shadow: push %d -> %d @%08x\n", froms[i], tos[i], pushes[i]);
+	}
+	sfxLogLine("install: rtshadow ok res=%d soft=%d (literal patch, %d bytes)\n",
+		res, soft, npatch);
 }
 
 void
