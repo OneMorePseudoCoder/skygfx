@@ -1621,35 +1621,25 @@ static int sfxW2DNoClear;
 static int sfxW2DZStripped;
 static int sfxLogZ, sfxLogZ0, sfxLogDS;
 static int sfxLogQ;
-// v9.15: force the game's own line-of-sight occlusion for every corona
-// while the overlay pass is active. Coronas flagged LOSCHECK_ON are drawn
-// by CCoronas::Render WITHOUT hardware z-test (the state toggle in the
-// render loop) and are hidden by the ProcessLineOfSight in
-// CRegisteredCorona::Update instead - a software path that does not
-// depend on the depth buffer and therefore works at any renderScale.
-// CRegisteredCorona: stride 0x3C, m_dwId @0x00 (0 = free),
-// m_bCheckObstacles = bit0 of the byte @0x34. Original flags are backed
-// up so renderScale=1.0 puts everything back.
-#define sfxCoronaArray   ((unsigned char*)0xC3E058)
-#define sfxCoronaCount   64
-#define sfxCoronaStride  0x3C
-#define sfxCoronaFlagOff 0x34
-static unsigned char sfxCoronaFlags[sfxCoronaCount];
-static int sfxCoronaShadowOn;
+// v9.16: software occlusion for coronas. CCoronas::Render draws coronas
+// NOT flagged LOSCHECK_ON with hardware z-testing only, and that path
+// bleeds through geometry when the scene is rendered at a smaller scale.
+// The game's own software occlusion (the LOSCHECK path in
+// CRegisteredCorona::Update, CWorld::GetIsLineOfSightClear) does not
+// depend on the depth buffer at all - so run the same check at render
+// start and zero FadedIntensity of occluded coronas for this frame.
+// CCoronas::Render skips coronas with FadedIntensity == 0, and the game
+// update refills the intensity natively afterwards (they fade back in
+// when renderScale is turned off - no state to restore).
+// CRegisteredCorona (SA 1.0 US): stride 0x3C, m_dwId @0x0C (0 = free),
+// m_vPosn @0x00, m_FadedIntensity @0x30. Array: 0xC3E058, 64 entries.
+// Setting the flag from the render hooks cannot work: RegisterCorona
+// rewrites it during the game process, which runs before the render.
+typedef unsigned char (__cdecl *sfxLosClearFn)(const void *from, const void *to,
+	int buildings, int vehicles, int peds, int objects, int dummies,
+	int seeThrough, int camIgnore);
+static sfxLosClearFn sfxLosClear = (sfxLosClearFn)0x56A490; // CWorld::GetIsLineOfSightClear
 static int sfxLogL;
-
-static void
-sfxCoronaRestore(void)
-{
-	int ci;
-	if(!sfxCoronaShadowOn)
-		return;
-	for(ci = 0; ci < sfxCoronaCount; ci++)
-		sfxCoronaArray[ci*sfxCoronaStride + sfxCoronaFlagOff] =
-			(sfxCoronaArray[ci*sfxCoronaStride + sfxCoronaFlagOff] & 0xFE)
-			| (sfxCoronaFlags[ci] & 0x01);
-	sfxCoronaShadowOn = 0;
-}
 static void
 sfxLogLine(const char *fmt, ...)
 {
@@ -1659,7 +1649,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.15) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.16) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1937,14 +1927,12 @@ RenderScale_Begin(void)
 		s = 0.5f;
 	sfxWorld2DDrawn = 0;
 	if(s >= 1.0f){
-		sfxCoronaRestore();
 		sfxScaleActive = 0;
 		sfxScaleApplied = 0;
 		return;
 	}
 	RwRaster *camR = RwCameraGetRaster(Scene.camera);
 	if(camR == nil || camR->width < 64 || camR->height < 64){
-		sfxCoronaRestore();
 		sfxScaleActive = 0;
 		sfxScaleApplied = 0;
 		return;
@@ -1956,7 +1944,6 @@ RenderScale_Begin(void)
 	sfxScaleInstallVtableHook();
 	if(!sfxScaleVtPatched || !d3dSetViewportOrig || !d3dGetViewport){
 		// without the vtable hooks we cannot control the viewport
-		sfxCoronaRestore();
 		sfxScaleActive = 0;
 		sfxScaleApplied = 0;
 		return;
@@ -1977,6 +1964,24 @@ RenderScale_Begin(void)
 	d3dSetViewportOrig(d3d9device, &vp);
 	sfxVpScaled = 1;
 	sfxScaleInScene = 1;
+	// v9.16: hide coronas occluded by geometry (see the note at sfxLosClear)
+	{
+		int ci, nchecked = 0, nhidden = 0;
+		RwV3d campos = RwFrameGetMatrix(RwCameraGetFrame(Scene.camera))->pos;
+		unsigned char *arr = (unsigned char*)0xC3E058;
+		for(ci = 0; ci < 64; ci++){
+			unsigned char *e = arr + ci*0x3C;
+			if(*(unsigned int*)(void*)(e + 0x0C) == 0 || e[0x30] == 0)
+				continue;
+			nchecked++;
+			if(!sfxLosClear((const void*)e, (const void*)&campos, 1, 0, 0, 0, 0, 0, 0)){
+				e[0x30] = 0; // blocked - renderer skips it this frame
+				nhidden++;
+			}
+		}
+		if(sfxLogL++ < 8)
+			sfxLogLine("L los %d checked, %d hidden\n", nchecked, nhidden);
+	}
 	sfxLogLine("B begin: scale=%.2f raster=%ux%u vp=%ux%u -> force %dx%d\n",
 		s, sfxSceneW, sfxSceneH, sfxVpFull.width, sfxVpFull.height, w, h);
 }
@@ -2085,26 +2090,6 @@ RenderScale_EndOfScene(void)
 		Scene.camera->frameBuffer = sfxW2DDimsRaster;
 		RsGlobal->MaximumWidth = (DWORD)sfxScaleW;
 		RsGlobal->MaximumHeight = (DWORD)sfxScaleH;
-		// v9.15: all active coronas draw via the game's LOS occlusion this
-		// frame (see the note at sfxCoronaFlags) - the hardware z-test path
-		// is what bleeds through geometry at renderScale < 1.0.
-		{
-			int ci, nf = 0;
-			if(!sfxCoronaShadowOn){
-				for(ci = 0; ci < sfxCoronaCount; ci++)
-					sfxCoronaFlags[ci] = sfxCoronaArray[ci*sfxCoronaStride + sfxCoronaFlagOff];
-				sfxCoronaShadowOn = 1;
-			}
-			for(ci = 0; ci < sfxCoronaCount; ci++){
-				unsigned char *e = sfxCoronaArray + ci*sfxCoronaStride;
-				if(*(unsigned int*)(void*)e != 0){
-					e[sfxCoronaFlagOff] |= 0x01;
-					nf++;
-				}
-			}
-			if(sfxLogL++ < 4)
-				sfxLogLine("L los force %d\n", nf);
-		}
 		sfxWorld2DDrawn = 0;
 		for(i = 0; i < 4; i++){
 			if(sfxW2Dhooks[i].ok){
