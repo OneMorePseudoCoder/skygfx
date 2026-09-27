@@ -1620,6 +1620,7 @@ static int sfxW2DVpFix;
 static int sfxW2DNoClear;
 static int sfxW2DZStripped;
 static int sfxLogZ, sfxLogZ0, sfxLogDS;
+static int sfxLogQ;
 static void
 sfxLogLine(const char *fmt, ...)
 {
@@ -1629,7 +1630,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.13) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.14) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2066,6 +2067,34 @@ RenderScale_EndOfScene(void)
 			d3d9device->SetRenderState(D3DRS_ZFUNC, oldZfn);
 		}
 		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, oldRwZTest);
+		// v9.14 DEBUG: translucent red quad over the whole sub-rect at FAR
+		// screen z (D3D9: z_ndc(far) = 1.0 = the depth clear value), z-test
+		// on, z-write off. It can only pass z-test where the scene never
+		// wrote depth. Red over sky = normal. Red over walls/buildings =
+		// the scene depth is missing there and occlusion can never work.
+		// Walls staying clean while coronas still bleed = the overlay z
+		// values themselves are the problem.
+		{
+			static RwIm2DVertex dq[4];
+			float fcp = RwCameraGetFarClipPlane(Scene.camera);
+			quadSetUV(dq, 0.0f, 0.0f, 1.0f, 1.0f);
+			quadSetXY(dq, 0.0f, 0.0f, (float)sfxScaleW, (float)sfxScaleH);
+			for(int q = 0; q < 4; q++){
+				RwIm2DVertexSetScreenZ(&dq[q], 1.0f);
+				RwIm2DVertexSetCameraZ(&dq[q], fcp);
+				RwIm2DVertexSetRecipCameraZ(&dq[q], fcp > 0.0f ? 1.0f/fcp : 1.0f);
+				RwIm2DVertexSetIntRGBA(&dq[q], 255, 0, 0, 96);
+			}
+			RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)NULL);
+			RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
+			RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, dq, 4, colorfilterIndices, 6);
+			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+			if(sfxLogQ++ < 8)
+				sfxLogLine("Q quad farz drawn\n");
+		}
 		sfxScaleInScene = 0;
 		sfxScaleActive = 0;
 		// everything back to normal before any further RW context call
