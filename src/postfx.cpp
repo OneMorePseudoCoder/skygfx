@@ -1623,6 +1623,7 @@ static int sfxLogZ, sfxLogZ0, sfxLogDS;
 static int sfxLogQ;
 static int sfxLogB, sfxLogR;
 static int sfxLogH;
+static void sfxHDRbind(void);
 // v9.19: the end-of-frame stretch is deferred out of RenderScale_EndOfScene
 // into the swallowed CCoronas::Render stub - see the long note in
 // RenderScale_EndOfScene. While sfxStretchPending is set the scale window
@@ -1644,7 +1645,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30b) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30c) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1827,6 +1828,27 @@ static int __stdcall
 sfxClearHook(void *dev, unsigned int count, void *rects,
 	unsigned int flags, unsigned int color, float z, unsigned int stencil)
 {
+	// v9.30c: RW binds the camera raster (the back buffer) at every
+	// camera begin and THEN issues the camera's clear - so without
+	// this, the FP16 target was never cleared and every frame drew
+	// over all previous ones (the ghosting screenshots). If a colour
+	// clear is issued while the back buffer is bound and the HDR
+	// scene window is open, switch to the FP16 target first so the
+	// clear - and the draws that follow, until the next full-size
+	// viewport rewrite re-asserts the bind - land in the HDR buffer.
+	// Any other bound target (env maps, shadow cameras) is untouched.
+	if(sfxHDRon && sfxScaleInScene && (flags & 0x1u)){
+		IDirect3DSurface9 *cur = nil, *bb = nil;
+		if(d3d9device->GetRenderTarget(0, &cur) == D3D_OK && cur != nil){
+			if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK
+					&& bb != nil){
+				if(cur == bb)
+					sfxHDRbind();
+				bb->Release();
+			}
+			cur->Release();
+		}
+	}
 	if(sfxW2DNoClear && (flags & 0x100u)){
 		flags &= ~0x100u;
 		sfxW2DZStripped++;
@@ -2404,6 +2426,13 @@ RenderScale_EndOfScene(void)
 	  if(sfxLogDS++ < 12)
 		sfxLogLine("Z1 ds=%08x\n", (unsigned int)ds1);
 	}
+	// v9.30c: resolve the FP16 scene into the back buffer BEFORE the
+	// overlay window opens - the window draws (coronas, LOD lights)
+	// land on top of the resolved frame and the deferred stretch then
+	// runs the stock copy+stretch, which bakes them in. (v9.30b
+	// resolved at the stretch instead, wiping the overlays.)
+	if(sfxHDRon)
+		sfxHDRresolve(camR);
 	// v9.11: draw the z-tested world overlays here - right after the
 	// camera re-bind, where the depth buffer is definitely bound - in the
 	// sub-rect coordinate space: scaled viewport for pipeline/Im3D draws,
@@ -2604,6 +2633,7 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->SetRenderState(D3DRS_ZENABLE, oldZen);
 	d3d9device->SetRenderState(D3DRS_CULLMODE, oldCull);
 	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, oldBlend);
+	sfxHDRon = 0;
 	RwCameraBeginUpdate(Scene.camera);
 	if(sfxLogR++ < 40)
 		sfxLogLine("H2 resolve fp16 %ux%u -> %ux%u @coronas\n",
@@ -2630,10 +2660,11 @@ RenderScale_DeferredStretch(void)
 	// draws into the stretched frame.
 	camR = sfxSavedFB;
 	Scene.camera->frameBuffer = camR;
-	if(sfxHDRon && sfxHDRresolve(camR)){
-		// resolved straight from the FP16 buffer; the RsGlobal and
-		// NoClear cleanup at the end of this function is shared
-	}else if(camR != nil && (sfxStretchRaster != nil
+	// v9.30c: the FP16 frame was already resolved into the back buffer
+	// at the end of the scene, before the overlay window - this now
+	// always runs the stock copy+stretch, which bakes the window
+	// overlays in, exactly like the non-HDR path.
+	if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
 		// full-raster coordinates
