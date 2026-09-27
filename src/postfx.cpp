@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.28) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.29) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1914,7 +1914,7 @@ sfxW2Dinstall(void)
 }
 
 // ------------------------------------------------------------------
-// v9.28: real-time shadow upgrade (opt-in, hardened full-chain patch)
+// v9.29: real-time shadow upgrade (opt-in, hardened full-chain patch + softness)
 //
 // History: v9.21 (entry trampolines) crashed inside
 // CRealTimeShadow::Create. v9.22 required a push DIRECTLY in front of
@@ -1967,6 +1967,14 @@ sfxW2Dinstall(void)
 // CRealTimeShadowManager::Init so every camera in the pipeline
 // matches. If the shadows still do not come back, the ground
 // texture theory is wrong and the final build stays entity-only.
+// v9.29: v9.28 completed the chain and the shadows came back sharper
+// (four sites, all readback verified) - the feature is validated on
+// this setup. Fifth and last knob: the blur pass count of
+// CRealTimeShadow::Create (the vanilla "push 4") = shadowSoftness,
+// -1 = vanilla 4 passes (nothing written), 1..8: fewer passes are
+// crisper, more are softer. The byte dumps now only run for non
+// vanilla configurations to keep the default log small.
+// shadowAllEntities stays NOT IMPLEMENTED (no effect).
 // ------------------------------------------------------------------
 static unsigned int sfxShadowCamCreateAddr = 0x705B60;	// CShadowCamera::Create(int)
 static unsigned char sfxRTShadowApplied;
@@ -2045,26 +2053,31 @@ void
 rtshadowhooks(void)
 {
 	int res = config->shadowResolution;
-	unsigned int calls[4], mfcalls[4];
+	unsigned int calls[4], mfcalls[4], ccalls[4];
 	unsigned int p, bp;
-	int blurPow;
+	int blurPow, soft;
 	if(sfxRTShadowApplied)
 		return;
 	sfxRTShadowApplied = 1;
-	sfxRTdump("Create", 0x706460, 0x706520);
-	sfxRTdump("Init", 0x7067C0, 0x706870);
-	sfxRTdump("CamCreate", 0x705B60, 0x705B80);
-	sfxRTdump("CamDtor", 0x705990, 0x705A20);
-	sfxRTdump("CamCreate2", 0x705B80, 0x705C80);
-	sfxRTdump("Gap520", 0x706520, 0x7067C0);
-	sfxRTdump("ReInit+DoShadow", 0x706870, 0x706D40);
-	sfxRTdump("HelperLight", 0x751A90, 0x751AD0);
-	sfxRTdump("HelperFirst", 0x752110, 0x752150);
-	sfxRTdump("RasterFn", 0x7EE4F0, 0x7EE550);
-	sfxRTdump("LightFn", 0x7F0410, 0x7F0430);
-	sfxRTdump("CopyFn", 0x804EF0, 0x804F10);
+	if(res != 7 || config->shadowSoftness >= 0){
+		sfxRTdump("Create", 0x706460, 0x706520);
+		sfxRTdump("Init", 0x7067C0, 0x706870);
+		sfxRTdump("CamCreate", 0x705B60, 0x705B80);
+		sfxRTdump("CamDtor", 0x705990, 0x705A20);
+		sfxRTdump("CamCreate2", 0x705B80, 0x705C80);
+		sfxRTdump("Gap520", 0x706520, 0x7067C0);
+		sfxRTdump("ReInit+DoShadow", 0x706870, 0x706D40);
+		sfxRTdump("HelperLight", 0x751A90, 0x751AD0);
+		sfxRTdump("HelperFirst", 0x752110, 0x752150);
+		sfxRTdump("RasterFn", 0x7EE4F0, 0x7EE550);
+		sfxRTdump("LightFn", 0x7F0410, 0x7F0430);
+		sfxRTdump("CopyFn", 0x804EF0, 0x804F10);
+	}
 	if(res < 6) res = 6;
 	if(res > 10) res = 10;
+	soft = config->shadowSoftness;
+	if(soft == 0) soft = 1;
+	if(soft > 8) soft = 8;
 
 	if(((unsigned char*)0x706460)[0] == 0xE9 ||
 	   ((unsigned char*)sfxShadowCamCreateAddr)[0] == 0xE9){
@@ -2084,8 +2097,8 @@ rtshadowhooks(void)
 		sfxLogLine("install: rtshadow ABORT - site is not 6A 07 @%08x\n", p);
 		return;
 	}
-	if(res == 7){
-		sfxLogLine("install: rtshadow ok res=7 (vanilla - nothing patched, push@%08x dist=%d)\n",
+	if(res == 7 && soft < 0){
+		sfxLogLine("install: rtshadow ok res=7 soft=vanilla (fully vanilla - nothing patched, push@%08x dist=%d)\n",
 			p, (int)(calls[0] - p));
 		return;
 	}
@@ -2131,7 +2144,31 @@ rtshadowhooks(void)
 	}else{
 		sfxLogLine("install: rtshadow manager call count mismatch - skipped\n");
 	}
-	sfxLogLine("install: rtshadow ok res=%d blur=%d (literal patch, readback verified)\n", res, blurPow);
+	// site 5 (v9.29): the blur pass count of CRealTimeShadow::Create
+	// (the vanilla "push 4") - shadowSoftness. The call is the only
+	// one in Manager::Init that targets 0x706460, and the push sits a
+	// few bytes in front of it between two "push 1"s, so it is
+	// verified by its 01 6A 04 6A context before anything is written.
+	if(soft >= 0){
+		if(sfxRTfindCalls(0x7067C0, 0x706870, 0x706460, ccalls, 4) == 1){
+			unsigned int q, sp = 0;
+			for(q = ccalls[0] >= 10 ? ccalls[0] - 10 : ccalls[0]; q + 3 <= ccalls[0]; q++){
+				unsigned char *b = (unsigned char*)q;
+				if(b[0] == 0x01 && b[1] == 0x6A && b[2] == 0x04 && b[3] == 0x6A)
+					sp = q + 1;
+			}
+			if(sp != 0 && ((unsigned char*)sp)[0] == 0x6A && ((unsigned char*)sp)[1] == 0x04){
+				sfxRTwriteByte(sp + 1, (unsigned char)soft);
+				sfxLogLine("RT shadow: blur passes 4 -> %d @%08x imm@%08x readback=%d\n",
+					soft, sp, sp + 1, (int)((unsigned char*)sp)[1]);
+			}else{
+				sfxLogLine("install: rtshadow softness site not found (call@%08x) - passes untouched\n", ccalls[0]);
+			}
+		}else{
+			sfxLogLine("install: rtshadow softness call count mismatch - passes untouched\n");
+		}
+	}
+	sfxLogLine("install: rtshadow ok res=%d blur=%d soft=%d (literal patch, readback verified)\n", res, blurPow, soft);
 }
 
 void
