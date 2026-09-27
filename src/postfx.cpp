@@ -1645,7 +1645,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30c) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30d) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2353,6 +2353,20 @@ RenderScale_Begin(void)
 		if(sfxHDRensure(camR->width, camR->height)){
 			sfxHDRon = 1;
 			sfxHDRbind();
+			// v9.30d THE actual ghosting fix: nothing clears the FP16
+			// target - the game's main camera only clears depth and
+			// relies on the sky covering the view, so there is no
+			// colour clear our hook could redirect. Clear it once per
+			// frame here, with the FULL viewport (Clear honours the
+			// viewport rect), then back to the scaled one.
+			{
+				struct SfxD3DViewport fvp = {0, 0, (unsigned int)camR->width, (unsigned int)camR->height, 0.0f, 1.0f};
+				d3dSetViewportOrig(d3d9device, &fvp);
+				d3d9device->Clear(0, nil, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
+				d3dSetViewportOrig(d3d9device, &vp);
+				if(sfxLogH++ < 8)
+					sfxLogLine("H clear fp16\n");
+			}
 			if(sfxLogH++ < 8)
 				sfxLogLine("H begin: scene window -> fp16 %dx%d\n", sfxHDRw, sfxHDRh);
 		}else
@@ -2426,13 +2440,6 @@ RenderScale_EndOfScene(void)
 	  if(sfxLogDS++ < 12)
 		sfxLogLine("Z1 ds=%08x\n", (unsigned int)ds1);
 	}
-	// v9.30c: resolve the FP16 scene into the back buffer BEFORE the
-	// overlay window opens - the window draws (coronas, LOD lights)
-	// land on top of the resolved frame and the deferred stretch then
-	// runs the stock copy+stretch, which bakes them in. (v9.30b
-	// resolved at the stretch instead, wiping the overlays.)
-	if(sfxHDRon)
-		sfxHDRresolve(camR);
 	// v9.11: draw the z-tested world overlays here - right after the
 	// camera re-bind, where the depth buffer is definitely bound - in the
 	// sub-rect coordinate space: scaled viewport for pipeline/Im3D draws,
@@ -2660,11 +2667,15 @@ RenderScale_DeferredStretch(void)
 	// draws into the stretched frame.
 	camR = sfxSavedFB;
 	Scene.camera->frameBuffer = camR;
-	// v9.30c: the FP16 frame was already resolved into the back buffer
-	// at the end of the scene, before the overlay window - this now
-	// always runs the stock copy+stretch, which bakes the window
-	// overlays in, exactly like the non-HDR path.
-	if(camR != nil && (sfxStretchRaster != nil
+	// v9.30d: the resolve happens HERE - after the overlay window, so
+	// the window draws (coronas, LOD lights) are already inside the
+	// FP16 buffer and are included in the single upscale. (v9.30c
+	// resolved before the window and stretched the already upscaled
+	// frame again - the double zoom in the screenshots.)
+	if(sfxHDRon && sfxHDRresolve(camR)){
+		// resolved straight from the FP16 buffer; the RsGlobal and
+		// NoClear cleanup at the end of this function is shared
+	}else if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
 		// full-raster coordinates
