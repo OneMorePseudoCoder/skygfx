@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.26) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.27) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1914,7 +1914,7 @@ sfxW2Dinstall(void)
 }
 
 // ------------------------------------------------------------------
-// v9.26: real-time shadow upgrade (opt-in, hardened single-site patch)
+// v9.27: real-time shadow upgrade (opt-in, hardened two-site patch)
 //
 // History: v9.21 (entry trampolines) crashed inside
 // CRealTimeShadow::Create. v9.22 required a push DIRECTLY in front of
@@ -1953,6 +1953,12 @@ sfxW2Dinstall(void)
 // and any other value always crashed the same way everywhere. The
 // write now targets p+1 and is gated by an explicit 6A 07 check so a
 // wrong site aborts instead of corrupting the instruction stream.
+// v9.27: v9.26 proved the mechanism on this setup (stable at res 8),
+// so the SECOND byte goes in as well: the blur camera raster inside
+// CRealTimeShadow::Create (the vanilla "push 6" - that texture is
+// what is actually drawn on the ground) scales to res-1, doubling
+// the visible ground shadow resolution from 64x64 to 128x128 at
+// res = 8. Every write is read back and verified in the log.
 // ------------------------------------------------------------------
 static unsigned int sfxShadowCamCreateAddr = 0x705B60;	// CShadowCamera::Create(int)
 static unsigned char sfxRTShadowApplied;
@@ -1985,13 +1991,13 @@ sfxRTfindCalls(unsigned int start, unsigned int end, unsigned int target,
 // in front of it, optionally followed by a thiscall ECX setup. Returns
 // the push address or 0.
 static unsigned int
-sfxRTfindPush7(unsigned int callAddr)
+sfxRTfindPushImm(unsigned int callAddr, unsigned char imm)
 {
 	unsigned int p, best = 0;
 	unsigned int minA = callAddr >= 7 ? callAddr - 7 : callAddr;
 	for(p = minA; p + 2 <= callAddr; p++){
 		unsigned char *q = (unsigned char*)p;
-		if(q[0] == 0x6A && q[1] == 7)
+		if(q[0] == 0x6A && q[1] == imm)
 			best = p;
 	}
 	if(best != 0){
@@ -2032,7 +2038,8 @@ rtshadowhooks(void)
 {
 	int res = config->shadowResolution;
 	unsigned int calls[4];
-	unsigned int p;
+	unsigned int p, bp;
+	int blurPow;
 	if(sfxRTShadowApplied)
 		return;
 	sfxRTShadowApplied = 1;
@@ -2060,7 +2067,7 @@ rtshadowhooks(void)
 		sfxLogLine("install: rtshadow ABORT - Create call count\n");
 		return;
 	}
-	p = sfxRTfindPush7(calls[0]);
+	p = sfxRTfindPushImm(calls[0], 7);
 	if(p == 0){
 		sfxLogLine("install: rtshadow ABORT - push 7 not found (hardened window, call@%08x)\n", calls[0]);
 		return;
@@ -2076,9 +2083,27 @@ rtshadowhooks(void)
 	}
 	sfxLogLine("install: rtshadow EXPERIMENTAL res=%d push@%08x call@%08x dist=%d\n",
 		res, p, calls[0], (int)(calls[0] - p));
+
+	// site 1: the entity shadow raster (source of the blur chain)
 	sfxRTwriteByte(p + 1, (unsigned char)res);	// v9.26 FIX: the immediate, not the opcode
-	sfxLogLine("RT shadow: push 7 -> %d @%08x imm@%08x (dist %d)\n", res, p, p + 1, (int)(calls[0] - p));
-	sfxLogLine("install: rtshadow ok res=%d soft=vanilla (single-site literal patch, 1 byte)\n", res);
+	sfxLogLine("RT shadow: entity push 7 -> %d @%08x imm@%08x readback=%d (dist %d)\n",
+		res, p, p + 1, (int)((unsigned char*)p)[1], (int)(calls[0] - p));
+
+	// site 2 (v9.27): the blur camera raster - the texture actually
+	// drawn on the ground; scale it to res-1 (min 6 = vanilla 64x64)
+	blurPow = res - 1;
+	if(blurPow < 6) blurPow = 6;
+	bp = sfxRTfindPushImm(calls[1], 6);
+	if(bp == 0 || ((unsigned char*)bp)[0] != 0x6A || ((unsigned char*)bp)[1] != 0x06){
+		sfxLogLine("install: rtshadow blur site not found (call@%08x) - entity raster only\n", calls[1]);
+	}else if(blurPow == 6){
+		sfxLogLine("install: rtshadow blur ok res=%d (vanilla 6 - nothing patched)\n", res);
+	}else{
+		sfxRTwriteByte(bp + 1, (unsigned char)blurPow);
+		sfxLogLine("RT shadow: blur push 6 -> %d @%08x imm@%08x readback=%d\n",
+			blurPow, bp, bp + 1, (int)((unsigned char*)bp)[1]);
+	}
+	sfxLogLine("install: rtshadow ok res=%d blur=%d (literal patch, readback verified)\n", res, blurPow);
 }
 
 void
