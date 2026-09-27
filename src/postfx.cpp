@@ -1590,6 +1590,13 @@ typedef int (__stdcall *sfxD3D3ArgFn)(void *, int, void *);
 static sfxD3D2ArgFn d3dSetViewportOrig;
 static sfxD3D2ArgFn d3dGetViewport;
 static sfxD3D3ArgFn d3dSetTransformOrig;
+// v9.11: D3DTS_PROJECTION=44 in this table, so Clear=43 and
+// GetDepthStencilSurface=40 (verified by the working SetTransform44 /
+// SetViewport47 / GetViewport48 mapping). GetDepthStencilSurface is only
+// called, never patched.
+typedef int (__stdcall *sfxClearFn)(void*, unsigned int, void*, unsigned int, float, unsigned int);
+static sfxClearFn d3dClearOrig;
+static sfxD3D2ArgFn d3dGetDepthStencil;
 
 // --- diagnostics (renderScaleDebugLog=1): append D3D state events to
 // skygfx_renderScale.log in the game folder (first 20000 lines) ---
@@ -1604,6 +1611,15 @@ static int sfxLogT, sfxLogC, sfxLogS, sfxLogP; // caps for in-window events
 // that window for the vp-fix counter in the SetViewport hook.
 static int sfxW2DPass;
 static int sfxW2DVpFix;
+// v9.11: while sfxW2DNoClear is set, the Clear hook (vtable slot 43)
+// strips D3DCLEAR_ZBUFFER (0x100) from every Clear - the scene depth
+// must survive from the end of the scene render until the world overlay
+// pass has finished drawing (BeginUpdate in setSceneRaster may otherwise
+// execute the camera's pending clear and wipe it). The sfxLogZ counters
+// gate the depth diagnostics in the log.
+static int sfxW2DNoClear;
+static int sfxW2DZStripped;
+static int sfxLogZ, sfxLogZ0, sfxLogDS;
 static void
 sfxLogLine(const char *fmt, ...)
 {
@@ -1613,7 +1629,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.10) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.11) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1681,6 +1697,22 @@ sfxSetViewportHook(void *dev, void *vp)
 	return d3dSetViewportOrig(dev, vp);
 }
 
+// v9.11: depth protection - during the world overlay window any
+// D3DCLEAR_ZBUFFER is dropped so the sub-rect depth survives
+static int __stdcall
+sfxClearHook(void *dev, unsigned int count, void *rects,
+	unsigned int flags, float z, unsigned int stencil)
+{
+	if(sfxW2DNoClear && (flags & 0x100u)){
+		flags &= ~0x100u;
+		sfxW2DZStripped++;
+		if(sfxLogZ++ < 8)
+			sfxLogLine("Zc strip f=%x\n", flags);
+	}else if(sfxLogZ0++ < 8)
+		sfxLogLine("Zc f=%x\n", flags);
+	return d3dClearOrig(dev, count, rects, flags, z, stencil);
+}
+
 static void
 sfxScaleInstallVtableHook(void)
 {
@@ -1698,10 +1730,14 @@ sfxScaleInstallVtableHook(void)
 	d3dSetTransformOrig = (sfxD3D3ArgFn)vt[44];
 	d3dSetViewportOrig = (sfxD3D2ArgFn)vt[47];
 	d3dGetViewport = (sfxD3D2ArgFn)vt[48];
-	sfxLogLine("install: orig SetTransform44=%08x SetViewport47=%08x GetViewport48=%08x\n",
+	d3dClearOrig = (sfxClearFn)vt[43];
+	d3dGetDepthStencil = (sfxD3D2ArgFn)vt[40];
+	sfxLogLine("install: orig SetTransform44=%08x SetViewport47=%08x GetViewport48=%08x Clear43=%08x DS40=%08x\n",
 		(unsigned int)(void*)d3dSetTransformOrig,
 		(unsigned int)(void*)d3dSetViewportOrig,
-		(unsigned int)(void*)d3dGetViewport);
+		(unsigned int)(void*)d3dGetViewport,
+		(unsigned int)(void*)d3dClearOrig,
+		(unsigned int)(void*)d3dGetDepthStencil);
 	// plausibility check: the "original" methods must be normal 32-bit
 	// code pointers. No module is assumed here: a d3d9-on-d12 style
 	// wrapper may implement the device in a different module.
@@ -1710,14 +1746,16 @@ sfxScaleInstallVtableHook(void)
 		|| (unsigned int)(void*)d3dGetViewport < 0x10000
 		|| (unsigned int)(void*)d3dGetViewport >= 0x80000000
 		|| (unsigned int)(void*)d3dSetTransformOrig < 0x10000
-		|| (unsigned int)(void*)d3dSetTransformOrig >= 0x80000000){
+		|| (unsigned int)(void*)d3dSetTransformOrig >= 0x80000000
+		|| (unsigned int)(void*)d3dClearOrig < 0x10000
+		|| (unsigned int)(void*)d3dClearOrig >= 0x80000000){
 		sfxLogLine("install: ABORT - original pointers not plausible\n");
 		sfxScaleVtTried = 1;
 		return;
 	}
 	// the vtable lives in a read-only section, so its page has to be
 	// made writable just for the patch and restored afterwards
-	size_t span = (size_t)((char*)&vt[48] - (char*)&vt[44]);
+	size_t span = (size_t)((char*)&vt[48] - (char*)&vt[43]);
 	DWORD oldProt = 0;
 	if(!VirtualProtect(&vt[44], span, PAGE_READWRITE, &oldProt)){
 		sfxLogLine("install: ABORT - VirtualProtect failed (err=%u)\n",
@@ -1725,19 +1763,23 @@ sfxScaleInstallVtableHook(void)
 		sfxScaleVtTried = 1;
 		return;
 	}
+	Patch((void*)(&vt[43]), (void*)sfxClearHook);
 	Patch((void*)(&vt[47]), (void*)sfxSetViewportHook);
 	Patch((void*)(&vt[44]), (void*)sfxSetTransformHook);
 	VirtualProtect(&vt[44], span, oldProt, &oldProt);
 	// verify the entries really took (read them back through the table)
-	if(vt[47] != (void*)sfxSetViewportHook || vt[44] != (void*)sfxSetTransformHook){
-		sfxLogLine("install: ABORT - readback mismatch s44=%08x s47=%08x\n",
-			(unsigned int)(void*)vt[44], (unsigned int)(void*)vt[47]);
+	if(vt[47] != (void*)sfxSetViewportHook || vt[44] != (void*)sfxSetTransformHook
+			|| vt[43] != (void*)sfxClearHook){
+		sfxLogLine("install: ABORT - readback mismatch s43=%08x s44=%08x s47=%08x\n",
+			(unsigned int)(void*)vt[43], (unsigned int)(void*)vt[44],
+			(unsigned int)(void*)vt[47]);
 		sfxScaleVtTried = 1;
 		return;
 	}
-	sfxLogLine("install: OK - vtable hooked SetTransform44=%08x SetViewport47=%08x\n",
+	sfxLogLine("install: OK - vtable hooked SetTransform44=%08x SetViewport47=%08x Clear43=%08x\n",
 		(unsigned int)(void*)sfxSetTransformHook,
-		(unsigned int)(void*)sfxSetViewportHook);
+		(unsigned int)(void*)sfxSetViewportHook,
+		(unsigned int)(void*)sfxClearHook);
 	sfxScaleVtPatched = 1;
 	sfxScaleVtTried = 1;
 }
@@ -1940,32 +1982,48 @@ RenderScale_EndOfScene(void)
 	sfxScaleApplied = 0;
 	sfxScaleActive = 0;
 	sfxScaleInScene = 0;
+	// v9.11 diagnostics: is the depth stencil still bound when the scene
+	// render is done? 00000000 here means the overlays could never have
+	// z-tested against the scene in v9.10's position.
+	{ void *ds = nil;
+	  if(d3dGetDepthStencil)
+		d3dGetDepthStencil(d3d9device, &ds);
+	  if(sfxLogDS++ < 12)
+		sfxLogLine("Z0 ds=%08x\n", (unsigned int)ds);
+	}
 	RwRaster *camR = RwCameraGetRaster(Scene.camera);
 	if(camR == nil || (sfxStretchRaster == nil
 			&& !ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		sfxLogLine("R no stretch (raster/scratch)\n");
 		return;
 	}
-	// v9.10: draw the z-tested world overlays FIRST - while the camera
-	// update context from the scene is still active and the depth buffer
-	// still holds the scene's z values. Doing this after setSceneRaster
-	// (v9.7..v9.9) put the pass behind an RwCameraBeginUpdate, which
-	// re-binds the raster and executes the camera's pending clear - the
-	// sub-rect depth was wiped, every corona z-test passed and the night
-	// lights kept shining through buildings (vpfix was 0 - the viewport
-	// was never the problem). The pass runs in the sub-rect coordinate
-	// space: scaled D3D viewport for pipeline/Im3D draws (neon, bright
-	// lights, markers), camera raster dims and RsGlobal screen size
-	// shrunk for the raster-space sprite maths (CSprite::CalcScreenCoors).
-	// The vtable enforcement stays armed for the pass (see sfxW2DPass).
+	// v9.11: from here to the end of the overlay pass, any
+	// D3DCLEAR_ZBUFFER is stripped so the scene depth survives
+	// (BeginUpdate below may otherwise execute the camera's pending clear)
+	sfxW2DNoClear = 1;
+	sfxW2DZStripped = 0;
+	// camera back on the full raster - RW re-issues the full-size viewport
+	setSceneRaster(camR);
+	// v9.11 diagnostics: depth stencil right after the camera re-bind
+	{ void *ds1 = nil;
+	  if(d3dGetDepthStencil)
+		d3dGetDepthStencil(d3d9device, &ds1);
+	  if(sfxLogDS++ < 12)
+		sfxLogLine("Z1 ds=%08x\n", (unsigned int)ds1);
+	}
+	// v9.11: draw the z-tested world overlays here - right after the
+	// camera re-bind, where the depth buffer is definitely bound - in the
+	// sub-rect coordinate space: scaled viewport for pipeline/Im3D draws,
+	// camera raster dims + RsGlobal shrunk for the raster-space sprite
+	// maths, vtable enforcement armed (vpfix), and any D3DCLEAR_ZBUFFER
+	// stripped (zstrip) so the depth cannot be wiped mid-flight.
 	if(sfxW2Dinstalled
 		&& ensureW2DDimsRaster(sfxScaleW, sfxScaleH, camR->depth)){
 		int i, n = 0;
 		RwRaster *savedFB = Scene.camera->frameBuffer;
 		DWORD savedRsW = RsGlobal->MaximumWidth;
 		DWORD savedRsH = RsGlobal->MaximumHeight;
-		// pipeline/Im3D draws follow the viewport - make sure it is on
-		// the sub-rect (it should already be - the scene just ended)
+		// pipeline/Im3D draws follow the viewport
 		struct SfxD3DViewport svp = {0, 0, (unsigned int)sfxScaleW, (unsigned int)sfxScaleH, 0.0f, 1.0f};
 		d3dSetViewportOrig(d3d9device, &svp);
 		sfxScaleActive = 1;
@@ -1994,14 +2052,17 @@ RenderScale_EndOfScene(void)
 		Scene.camera->frameBuffer = savedFB;
 		struct SfxD3DViewport fullvp = {0, 0, (unsigned int)camR->width, (unsigned int)camR->height, 0.0f, 1.0f};
 		d3dSetViewportOrig(d3d9device, &fullvp);
-		if(n > 0 && sfxW2Dlogs < 8){
+		{ void *ds2 = nil;
+		  if(d3dGetDepthStencil)
+			d3dGetDepthStencil(d3d9device, &ds2);
+		  if(n > 0 && sfxW2Dlogs < 8){
 			sfxW2Dlogs++;
-			sfxLogLine("M world2d early: %d overlays, vp+dims %dx%d vpfix %d\n",
-				n, sfxScaleW, sfxScaleH, sfxW2DVpFix);
+			sfxLogLine("M world2d: %d overlays, dims %dx%d vpfix %d zstrip %d ds=%08x\n",
+				n, sfxScaleW, sfxScaleH, sfxW2DVpFix, sfxW2DZStripped, (unsigned int)ds2);
+		  }
 		}
-	}
-	// camera back on the full raster - RW re-issues the full-size viewport
-	setSceneRaster(camR);
+	}else
+		sfxW2DNoClear = 0;
 	// 1:1 copy of the frame into the scratch raster (the camera raster is
 	// the back buffer and can not be sampled as a texture - that was the
 	// v9.1 white screen)
