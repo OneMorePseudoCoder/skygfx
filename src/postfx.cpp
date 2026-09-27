@@ -1621,6 +1621,35 @@ static int sfxW2DNoClear;
 static int sfxW2DZStripped;
 static int sfxLogZ, sfxLogZ0, sfxLogDS;
 static int sfxLogQ;
+// v9.15: force the game's own line-of-sight occlusion for every corona
+// while the overlay pass is active. Coronas flagged LOSCHECK_ON are drawn
+// by CCoronas::Render WITHOUT hardware z-test (the state toggle in the
+// render loop) and are hidden by the ProcessLineOfSight in
+// CRegisteredCorona::Update instead - a software path that does not
+// depend on the depth buffer and therefore works at any renderScale.
+// CRegisteredCorona: stride 0x3C, m_dwId @0x00 (0 = free),
+// m_bCheckObstacles = bit0 of the byte @0x34. Original flags are backed
+// up so renderScale=1.0 puts everything back.
+#define sfxCoronaArray   ((unsigned char*)0xC3E058)
+#define sfxCoronaCount   64
+#define sfxCoronaStride  0x3C
+#define sfxCoronaFlagOff 0x34
+static unsigned char sfxCoronaFlags[sfxCoronaCount];
+static int sfxCoronaShadowOn;
+static int sfxLogL;
+
+static void
+sfxCoronaRestore(void)
+{
+	int ci;
+	if(!sfxCoronaShadowOn)
+		return;
+	for(ci = 0; ci < sfxCoronaCount; ci++)
+		sfxCoronaArray[ci*sfxCoronaStride + sfxCoronaFlagOff] =
+			(sfxCoronaArray[ci*sfxCoronaStride + sfxCoronaFlagOff] & 0xFE)
+			| (sfxCoronaFlags[ci] & 0x01);
+	sfxCoronaShadowOn = 0;
+}
 static void
 sfxLogLine(const char *fmt, ...)
 {
@@ -1630,7 +1659,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.14) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.15) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1908,12 +1937,14 @@ RenderScale_Begin(void)
 		s = 0.5f;
 	sfxWorld2DDrawn = 0;
 	if(s >= 1.0f){
+		sfxCoronaRestore();
 		sfxScaleActive = 0;
 		sfxScaleApplied = 0;
 		return;
 	}
 	RwRaster *camR = RwCameraGetRaster(Scene.camera);
 	if(camR == nil || camR->width < 64 || camR->height < 64){
+		sfxCoronaRestore();
 		sfxScaleActive = 0;
 		sfxScaleApplied = 0;
 		return;
@@ -1925,6 +1956,7 @@ RenderScale_Begin(void)
 	sfxScaleInstallVtableHook();
 	if(!sfxScaleVtPatched || !d3dSetViewportOrig || !d3dGetViewport){
 		// without the vtable hooks we cannot control the viewport
+		sfxCoronaRestore();
 		sfxScaleActive = 0;
 		sfxScaleApplied = 0;
 		return;
@@ -2053,9 +2085,33 @@ RenderScale_EndOfScene(void)
 		Scene.camera->frameBuffer = sfxW2DDimsRaster;
 		RsGlobal->MaximumWidth = (DWORD)sfxScaleW;
 		RsGlobal->MaximumHeight = (DWORD)sfxScaleH;
+		// v9.15: all active coronas draw via the game's LOS occlusion this
+		// frame (see the note at sfxCoronaFlags) - the hardware z-test path
+		// is what bleeds through geometry at renderScale < 1.0.
+		{
+			int ci, nf = 0;
+			if(!sfxCoronaShadowOn){
+				for(ci = 0; ci < sfxCoronaCount; ci++)
+					sfxCoronaFlags[ci] = sfxCoronaArray[ci*sfxCoronaStride + sfxCoronaFlagOff];
+				sfxCoronaShadowOn = 1;
+			}
+			for(ci = 0; ci < sfxCoronaCount; ci++){
+				unsigned char *e = sfxCoronaArray + ci*sfxCoronaStride;
+				if(*(unsigned int*)(void*)e != 0){
+					e[sfxCoronaFlagOff] |= 0x01;
+					nf++;
+				}
+			}
+			if(sfxLogL++ < 4)
+				sfxLogLine("L los force %d\n", nf);
+		}
 		sfxWorld2DDrawn = 0;
 		for(i = 0; i < 4; i++){
 			if(sfxW2Dhooks[i].ok){
+				// v9.15: CCoronas::Render leaves the z-test state flipped
+				// (no restore at the end) - re-arm it for the next draws
+				if(i > 0)
+					RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
 				((sfxVoidCall)sfxW2Dhooks[i].addr)();
 				n++;
 			}
@@ -2067,34 +2123,6 @@ RenderScale_EndOfScene(void)
 			d3d9device->SetRenderState(D3DRS_ZFUNC, oldZfn);
 		}
 		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, oldRwZTest);
-		// v9.14 DEBUG: translucent red quad over the whole sub-rect at FAR
-		// screen z (D3D9: z_ndc(far) = 1.0 = the depth clear value), z-test
-		// on, z-write off. It can only pass z-test where the scene never
-		// wrote depth. Red over sky = normal. Red over walls/buildings =
-		// the scene depth is missing there and occlusion can never work.
-		// Walls staying clean while coronas still bleed = the overlay z
-		// values themselves are the problem.
-		{
-			static RwIm2DVertex dq[4];
-			float fcp = RwCameraGetFarClipPlane(Scene.camera);
-			quadSetUV(dq, 0.0f, 0.0f, 1.0f, 1.0f);
-			quadSetXY(dq, 0.0f, 0.0f, (float)sfxScaleW, (float)sfxScaleH);
-			for(int q = 0; q < 4; q++){
-				RwIm2DVertexSetScreenZ(&dq[q], 1.0f);
-				RwIm2DVertexSetCameraZ(&dq[q], fcp);
-				RwIm2DVertexSetRecipCameraZ(&dq[q], fcp > 0.0f ? 1.0f/fcp : 1.0f);
-				RwIm2DVertexSetIntRGBA(&dq[q], 255, 0, 0, 96);
-			}
-			RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
-			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)NULL);
-			RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
-			RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
-			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
-			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, dq, 4, colorfilterIndices, 6);
-			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
-			if(sfxLogQ++ < 8)
-				sfxLogLine("Q quad farz drawn\n");
-		}
 		sfxScaleInScene = 0;
 		sfxScaleActive = 0;
 		// everything back to normal before any further RW context call
