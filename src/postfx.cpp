@@ -1613,7 +1613,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.9) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.10) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1946,36 +1946,34 @@ RenderScale_EndOfScene(void)
 		sfxLogLine("R no stretch (raster/scratch)\n");
 		return;
 	}
-	// camera back on the full raster - RW re-issues the full-size viewport
-	setSceneRaster(camR);
-	// v9.8: draw the z-tested world overlays now, before the stretch, in
-	// the sub-rect coordinate space (see the note above sfxW2Dhooks):
-	// scaled D3D viewport for the pipeline/Im3D passes, camera raster
-	// dims and RsGlobal screen size shrunk for the raster-space sprite
-	// maths (CSprite::CalcScreenCoors). After the stretch none of that
-	// would match the sub-rect depth buffer any more.
+	// v9.10: draw the z-tested world overlays FIRST - while the camera
+	// update context from the scene is still active and the depth buffer
+	// still holds the scene's z values. Doing this after setSceneRaster
+	// (v9.7..v9.9) put the pass behind an RwCameraBeginUpdate, which
+	// re-binds the raster and executes the camera's pending clear - the
+	// sub-rect depth was wiped, every corona z-test passed and the night
+	// lights kept shining through buildings (vpfix was 0 - the viewport
+	// was never the problem). The pass runs in the sub-rect coordinate
+	// space: scaled D3D viewport for pipeline/Im3D draws (neon, bright
+	// lights, markers), camera raster dims and RsGlobal screen size
+	// shrunk for the raster-space sprite maths (CSprite::CalcScreenCoors).
+	// The vtable enforcement stays armed for the pass (see sfxW2DPass).
 	if(sfxW2Dinstalled
 		&& ensureW2DDimsRaster(sfxScaleW, sfxScaleH, camR->depth)){
 		int i, n = 0;
 		RwRaster *savedFB = Scene.camera->frameBuffer;
 		DWORD savedRsW = RsGlobal->MaximumWidth;
 		DWORD savedRsH = RsGlobal->MaximumHeight;
-		// pipeline/Im3D draws follow the viewport - put it back on the
-		// sub-rect (the state RW left after the scene render)
+		// pipeline/Im3D draws follow the viewport - make sure it is on
+		// the sub-rect (it should already be - the scene just ended)
 		struct SfxD3DViewport svp = {0, 0, (unsigned int)sfxScaleW, (unsigned int)sfxScaleH, 0.0f, 1.0f};
 		d3dSetViewportOrig(d3d9device, &svp);
-		// v9.9: re-arm the vtable enforcement for the duration of the pass.
-		// RW re-issues the camera's full-size viewport while the overlays
-		// draw (Im3D/pipeline state changes); with sfxScaleActive back on,
-		// every such full-size SetViewport is rewritten to the sub-rect
-		// again instead of silently undoing the one above (that was the
-		// v9.8 failure), and projection changes re-assert it as in-scene.
 		sfxScaleActive = 1;
 		sfxScaleInScene = 1;
 		sfxW2DPass = 1;
 		sfxW2DVpFix = 0;
 		// raster-space maths (coronas, flares) must produce sub-rect
-		// coordinates as well - lie about the screen and raster size
+		// coordinates - lie about the screen and raster size
 		Scene.camera->frameBuffer = sfxW2DDimsRaster;
 		RsGlobal->MaximumWidth = (DWORD)sfxScaleW;
 		RsGlobal->MaximumHeight = (DWORD)sfxScaleH;
@@ -1998,10 +1996,12 @@ RenderScale_EndOfScene(void)
 		d3dSetViewportOrig(d3d9device, &fullvp);
 		if(n > 0 && sfxW2Dlogs < 8){
 			sfxW2Dlogs++;
-			sfxLogLine("M world2d pre-stretch: %d overlays, vp+dims %dx%d vpfix %d\n",
+			sfxLogLine("M world2d early: %d overlays, vp+dims %dx%d vpfix %d\n",
 				n, sfxScaleW, sfxScaleH, sfxW2DVpFix);
 		}
 	}
+	// camera back on the full raster - RW re-issues the full-size viewport
+	setSceneRaster(camR);
 	// 1:1 copy of the frame into the scratch raster (the camera raster is
 	// the back buffer and can not be sampled as a texture - that was the
 	// v9.1 white screen)
