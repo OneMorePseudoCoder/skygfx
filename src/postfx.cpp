@@ -1594,7 +1594,7 @@ static sfxD3D3ArgFn d3dSetTransformOrig;
 // GetDepthStencilSurface=40 (verified by the working SetTransform44 /
 // SetViewport47 / GetViewport48 mapping). GetDepthStencilSurface is only
 // called, never patched.
-typedef int (__stdcall *sfxClearFn)(void*, unsigned int, void*, unsigned int, float, unsigned int);
+typedef int (__stdcall *sfxClearFn)(void*, unsigned int, void*, unsigned int, unsigned int, float, unsigned int);
 static sfxClearFn d3dClearOrig;
 static sfxD3D2ArgFn d3dGetDepthStencil;
 
@@ -1629,7 +1629,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.11) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.12) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1701,7 +1701,7 @@ sfxSetViewportHook(void *dev, void *vp)
 // D3DCLEAR_ZBUFFER is dropped so the sub-rect depth survives
 static int __stdcall
 sfxClearHook(void *dev, unsigned int count, void *rects,
-	unsigned int flags, float z, unsigned int stencil)
+	unsigned int flags, unsigned int color, float z, unsigned int stencil)
 {
 	if(sfxW2DNoClear && (flags & 0x100u)){
 		flags &= ~0x100u;
@@ -1709,8 +1709,8 @@ sfxClearHook(void *dev, unsigned int count, void *rects,
 		if(sfxLogZ++ < 8)
 			sfxLogLine("Zc strip f=%x\n", flags);
 	}else if(sfxLogZ0++ < 8)
-		sfxLogLine("Zc f=%x\n", flags);
-	return d3dClearOrig(dev, count, rects, flags, z, stencil);
+		sfxLogLine("Zc f=%x c=%x\n", flags, color);
+	return d3dClearOrig(dev, count, rects, flags, color, z, stencil);
 }
 
 static void
