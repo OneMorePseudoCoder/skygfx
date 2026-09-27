@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.22) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.22b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1986,8 +1986,7 @@ sfxRTpatchPush(unsigned int start, unsigned int end, unsigned int target,
 			continue;
 		if(p[-2] == 0x6A && p[-1] == from){
 			sfxRTwriteByte(a - 1, to);
-			sfxLogLine("RT shadow: push %d -> %d @%08x
-", from, to, a - 1);
+			sfxLogLine("RT shadow: push %d -> %d @%08x\n", from, to, a - 1);
 			n++;
 		}
 	}
