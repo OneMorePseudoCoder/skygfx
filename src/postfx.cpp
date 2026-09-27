@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.21) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.22) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1914,155 +1914,121 @@ sfxW2Dinstall(void)
 }
 
 // ------------------------------------------------------------------
-// v9.21: real-time shadow upgrade
+// v9.22: real-time shadow upgrade (literal patch design)
 //
-// SA renders each ped/vehicle shadow into a small top-down raster and
-// then downsamples it AGAIN to half size (CRealTimeShadow::Update ->
-// m_blurCamera.RasterResample) before blurring and projecting it onto
-// the ground, so the shadow you see is textured from a 64x64 raster -
-// hence the blocky edges. Every shadow raster in the game is
-// allocated in exactly one place, CShadowCamera::Create(power)
-// (0x705B60, raster = 1 << power): power 7 builds the per entity
-// shadow camera, power 6 its blur camera and the manager blur and
-// gradient cameras. No other system calls it, and none of the
-// resample/blur helpers hardcode a size (they read the raster
-// dimensions), so raising the exponent there upgrades the whole
-// pipeline consistently. The shadow texture is already rwFILTERLINEAR,
-// so resolution is the only sharpness knob.
+// v9.21 hooked the entry points of CShadowCamera::Create and
+// CRealTimeShadow::Create with jump trampolines (restore 5 bytes ->
+// call original -> re-install jump) and crashed inside
+// CRealTimeShadow::Create on new game: the retail code did not
+// tolerate the trampoline around this thiscall (the crash dump shows
+// a corrupted this/argument area on the first creation from
+// CRealTimeShadowManager::Init). This build does NOT hook any
+// function entry. The shadow raster sizes and the blur pass count are
+// plain push-immediate literals at the call sites:
 //
-// shadowSoftness replaces the blur pass count the manager passes to
-// CRealTimeShadow::Create (0x706460, vanilla 4 passes).
-// shadowAllEntities removes the FX quality gate in
-// CRealTimeShadowManager::DoShadowThisFrame (0x706BA0): vanilla only
-// keeps real-time shadows for the player unless FX is Very High.
-// The 5 byte patches use the same save/restore trampoline scheme as
-// the world2d hooks above (game code is single threaded and none of
-// these functions recurse).
+//   CRealTimeShadow::Create (0x706460):
+//       push 7; call CShadowCamera::Create  -> entity shadow raster 1<<7
+//       push 6; call CShadowCamera::Create  -> blur raster 1<<6
+//   CRealTimeShadowManager::Init (0x7067C0):
+//       push 4; call CRealTimeShadow::Create -> blur passes (vanilla 4)
+//       push 6; call CShadowCamera::Create   -> manager blur camera
+//       push 6; call CShadowCamera::Create   -> manager gradient camera
+//
+// So we just rewrite those immediate bytes in place (one byte per
+// site). Every patch is self-verifying: only a 6A xx push immediately
+// in front of an E8 call whose target matches is rewritten, and the
+// call sites are counted first - if the binary does not look as
+// expected nothing is patched at all (pure vanilla behaviour).
+// With shadowResolution=7 and shadowSoftness=-1 (or unset) not a
+// single byte of the game is modified.
+// shadowAllEntities is postponed (it needed a function entry hook).
 // ------------------------------------------------------------------
-static unsigned int sfxShadowCamAddr = 0x705B60;	// CShadowCamera::Create(int)
-static unsigned int sfxRTCreateAddr = 0x706460;		// CRealTimeShadow::Create
-static unsigned int sfxRTDoAddr = 0x706BA0;		// DoShadowThisFrame
-static unsigned char sfxShadowCamOrig[5], sfxShadowCamJmp[5];
-static unsigned char sfxRTCreateOrig[5], sfxRTCreateJmp[5];
-static unsigned char sfxRTDoOrig[5], sfxRTDoJmp[5];
-static int sfxRTShadowInstalled;
-static int sfxRTShadowLogs;
+static unsigned int sfxShadowCamCreateAddr = 0x705B60;	// CShadowCamera::Create(int)
+static unsigned int sfxRTShadowCreateAddr = 0x706460;	// CRealTimeShadow::Create
+static unsigned char sfxRTShadowApplied;
 
 static void
-sfxRTwrite(unsigned int addr, const unsigned char *bytes)
+sfxRTwriteByte(unsigned int addr, unsigned char b)
 {
 	DWORD old;
-	VirtualProtect((void*)addr, 5, PAGE_EXECUTE_READWRITE, &old);
-	memcpy((void*)addr, bytes, 5);
-	VirtualProtect((void*)addr, 5, old, &old);
+	VirtualProtect((void*)addr, 1, PAGE_EXECUTE_READWRITE, &old);
+	*(unsigned char*)addr = b;
+	VirtualProtect((void*)addr, 1, old, &old);
 }
 
-// CShadowCamera::Create(int power) - raise the raster size exponent
-static RwCamera *
-sfxShadowCamCreate_hook(void *self, void *edx, int power)
+// number of "call target" sites in the given (start..end) range
+static int
+sfxRTcountCalls(unsigned int start, unsigned int end, unsigned int target)
 {
-	RwCamera *(__fastcall *orig)(void*, void*, int) =
-		(RwCamera *(__fastcall*)(void*, void*, int))sfxShadowCamAddr;
-	RwCamera *r;
-	int p = power;
-	if(p >= 6 && p <= 7){
-		int res = config->shadowResolution;
-		if(res >= 6 && res <= 10){
-			p += res - 7;
-			if(p > 10)
-				p = 10;
-			if(p < 5)
-				p = 5;
+	unsigned int a;
+	int n = 0;
+	for(a = start; a < end - 6; a++){
+		unsigned char *p = (unsigned char*)a;
+		if(p[0] == 0xE8 && (unsigned int)(a + 5 + *(int *)(p + 1)) == target)
+			n++;
+	}
+	return n;
+}
+
+// rewrite every "push from; call target" in the (start..end) range to
+// "push to". Returns the number of sites patched.
+static int
+sfxRTpatchPush(unsigned int start, unsigned int end, unsigned int target,
+		unsigned char from, unsigned char to)
+{
+	unsigned int a;
+	int n = 0;
+	for(a = start; a < end - 6; a++){
+		unsigned char *p = (unsigned char*)a;
+		if(p[0] != 0xE8)
+			continue;
+		if((unsigned int)(a + 5 + *(int *)(p + 1)) != target)
+			continue;
+		if(p[-2] == 0x6A && p[-1] == from){
+			sfxRTwriteByte(a - 1, to);
+			sfxLogLine("RT shadow: push %d -> %d @%08x
+", from, to, a - 1);
+			n++;
 		}
 	}
-	if(p != power && sfxRTShadowLogs < 40){
-		sfxRTShadowLogs++;
-		sfxLogLine("RT shadow: raster 1<<%d -> 1<<%d\n", power, p);
-	}
-	sfxRTwrite(sfxShadowCamAddr, sfxShadowCamOrig);
-	r = orig(self, nil, p);
-	sfxRTwrite(sfxShadowCamAddr, sfxShadowCamJmp);
-	return r;
-}
-
-// CRealTimeShadow::Create(isBlurred, blurPasses, drawMoreBlur) - blur passes
-static int
-sfxRTShadowCreate_hook(void *self, void *edx, int isBlurred, int blurPasses, int drawMoreBlur)
-{
-	int (__fastcall *orig)(void*, void*, int, int, int) =
-		(int (__fastcall*)(void*, void*, int, int, int))sfxRTCreateAddr;
-	int soft = config->shadowSoftness;
-	int r;
-	if(soft >= 0){
-		if(soft > 8)
-			soft = 8;
-		blurPasses = soft;
-	}
-	sfxRTwrite(sfxRTCreateAddr, sfxRTCreateOrig);
-	r = orig(self, nil, isBlurred, blurPasses, drawMoreBlur);
-	sfxRTwrite(sfxRTCreateAddr, sfxRTCreateJmp);
-	return r;
-}
-
-// CRealTimeShadowManager::DoShadowThisFrame(CPhysical*) - shadows for all
-static void
-sfxRTShadowDo_hook(void *self, void *edx, void *physical)
-{
-	void (__fastcall *orig)(void*, void*, void*) =
-		(void (__fastcall*)(void*, void*, void*))sfxRTDoAddr;
-	if(config->shadowAllEntities && physical != nil){
-		// the vanilla tail of this function without the FX quality
-		// gate (offsets verified against plugin-sdk/gta-reversed:
-		// CPhysical::m_pShadowData 0x134, keepalive 0x4, manager
-		// GetRealTimeShadow 0x706970)
-		unsigned char *shdw = *(unsigned char**)((char*)physical + 0x134);
-		void *(__fastcall *getRT)(void*, void*, void*) =
-			(void *(__fastcall*)(void*, void*, void*))0x706970;
-		if(shdw != nil)
-			shdw[0x4] = 1;	// m_bKeepAlive
-		else
-			getRT(self, nil, physical);
-		return;
-	}
-	sfxRTwrite(sfxRTDoAddr, sfxRTDoOrig);
-	orig(self, nil, physical);
-	sfxRTwrite(sfxRTDoAddr, sfxRTDoJmp);
+	return n;
 }
 
 void
 rtshadowhooks(void)
 {
-	if(sfxRTShadowInstalled)
+	int res = config->shadowResolution;
+	int soft = config->shadowSoftness;
+	if(sfxRTShadowApplied)
 		return;
-	sfxRTShadowInstalled = 1;
-	if(((unsigned char*)sfxShadowCamAddr)[0] == 0xE9 ||
-	   ((unsigned char*)sfxRTCreateAddr)[0] == 0xE9 ||
-	   ((unsigned char*)sfxRTDoAddr)[0] == 0xE9){
-		// hooked by something else (SAMP, another mod) - leave alone
-		sfxLogLine("install: rtshadow skip - game function already hooked\n");
-		return;
-	}
-	memcpy(sfxShadowCamOrig, (void*)sfxShadowCamAddr, 5);
-	memcpy(sfxRTCreateOrig, (void*)sfxRTCreateAddr, 5);
-	memcpy(sfxRTDoOrig, (void*)sfxRTDoAddr, 5);
-	InjectHook(sfxShadowCamAddr, sfxShadowCamCreate_hook, PATCH_JUMP);
-	InjectHook(sfxRTCreateAddr, sfxRTShadowCreate_hook, PATCH_JUMP);
-	InjectHook(sfxRTDoAddr, sfxRTShadowDo_hook, PATCH_JUMP);
-	memcpy(sfxShadowCamJmp, (void*)sfxShadowCamAddr, 5);
-	memcpy(sfxRTCreateJmp, (void*)sfxRTCreateAddr, 5);
-	memcpy(sfxRTDoJmp, (void*)sfxRTDoAddr, 5);
-	if(sfxShadowCamJmp[0] != 0xE9 || sfxRTCreateJmp[0] != 0xE9 || sfxRTDoJmp[0] != 0xE9){
-		// patch did not take - restore everything
-		sfxRTwrite(sfxShadowCamAddr, sfxShadowCamOrig);
-		sfxRTwrite(sfxRTCreateAddr, sfxRTCreateOrig);
-		sfxRTwrite(sfxRTDoAddr, sfxRTDoOrig);
-		sfxLogLine("install: rtshadow ABORT - patch did not take\n");
+	sfxRTShadowApplied = 1;
+	if(res < 6) res = 6;
+	if(res > 10) res = 10;
+	if(soft > 8) soft = 8;
+
+	// validate the layout first - abort to pure vanilla on mismatch
+	if(sfxRTcountCalls(0x706460, 0x706520, sfxShadowCamCreateAddr) != 2){
+		sfxLogLine("install: rtshadow ABORT - unexpected CRealTimeShadow::Create layout\n");
 		return;
 	}
-	sfxLogLine("install: rtshadow ok res=%d soft=%d all=%d cam=%02X%02X%02X%02X%02X\n",
-		config->shadowResolution, config->shadowSoftness, config->shadowAllEntities,
-		sfxShadowCamOrig[0], sfxShadowCamOrig[1], sfxShadowCamOrig[2],
-		sfxShadowCamOrig[3], sfxShadowCamOrig[4]);
+	if(sfxRTcountCalls(0x7067C0, 0x706870, sfxShadowCamCreateAddr) != 2 ||
+	   sfxRTcountCalls(0x7067C0, 0x706870, sfxRTShadowCreateAddr) != 1){
+		sfxLogLine("install: rtshadow ABORT - unexpected shadow manager Init layout\n");
+		return;
+	}
+
+	if(res != 7){
+		// 1 entity shadow + 1 blur raster + 2 manager cameras = 4 sites
+		int n = 0;
+		n += sfxRTpatchPush(0x706460, 0x706520, sfxShadowCamCreateAddr, 7, res);
+		n += sfxRTpatchPush(0x706460, 0x706520, sfxShadowCamCreateAddr, 6, res - 1);
+		n += sfxRTpatchPush(0x7067C0, 0x706870, sfxShadowCamCreateAddr, 6, res - 1);
+		sfxLogLine("install: rtshadow raster sites patched %d\n", n);
+	}
+	if(soft >= 0 && soft != 4)
+		sfxLogLine("install: rtshadow blur sites patched %d\n",
+			sfxRTpatchPush(0x7067C0, 0x706870, sfxRTShadowCreateAddr, 4, (unsigned char)soft));
+	sfxLogLine("install: rtshadow ok res=%d soft=%d (literal patch)\n", res, soft);
 }
 
 void
