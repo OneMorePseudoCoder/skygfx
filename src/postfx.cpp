@@ -1629,7 +1629,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.12) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.13) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2030,6 +2030,23 @@ RenderScale_EndOfScene(void)
 		sfxScaleInScene = 1;
 		sfxW2DPass = 1;
 		sfxW2DVpFix = 0;
+		// v9.13: the v9.12 log proved the depth surface is bound and never
+		// cleared during the window (Z0=Z1=M ds identical, zstrip 0) - so if
+		// overlays still pass through geometry, the z TEST itself must be off
+		// by the time RenderScene returns (device left with ZENABLE=0 or a
+		// non-LESSEQUAL z func). Force it on for the pass, remember what it
+		// actually was, restore afterwards.
+		DWORD oldZen = 0, oldZwr = 0, oldZfn = 0;
+		void *oldRwZTest = nil;
+		if(d3d9device){
+			d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
+			d3d9device->GetRenderState(D3DRS_ZWRITEENABLE, &oldZwr);
+			d3d9device->GetRenderState(D3DRS_ZFUNC, &oldZfn);
+			d3d9device->SetRenderState(D3DRS_ZENABLE, TRUE);
+			d3d9device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+		}
+		RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &oldRwZTest);
+		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
 		// raster-space maths (coronas, flares) must produce sub-rect
 		// coordinates - lie about the screen and raster size
 		Scene.camera->frameBuffer = sfxW2DDimsRaster;
@@ -2044,6 +2061,11 @@ RenderScale_EndOfScene(void)
 		}
 		sfxWorld2DDrawn = 1;
 		sfxW2DPass = 0;
+		if(d3d9device){
+			d3d9device->SetRenderState(D3DRS_ZENABLE, oldZen);
+			d3d9device->SetRenderState(D3DRS_ZFUNC, oldZfn);
+		}
+		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, oldRwZTest);
 		sfxScaleInScene = 0;
 		sfxScaleActive = 0;
 		// everything back to normal before any further RW context call
@@ -2057,8 +2079,9 @@ RenderScale_EndOfScene(void)
 			d3dGetDepthStencil(d3d9device, &ds2);
 		  if(n > 0 && sfxW2Dlogs < 8){
 			sfxW2Dlogs++;
-			sfxLogLine("M world2d: %d overlays, dims %dx%d vpfix %d zstrip %d ds=%08x\n",
-				n, sfxScaleW, sfxScaleH, sfxW2DVpFix, sfxW2DZStripped, (unsigned int)ds2);
+			sfxLogLine("M world2d: %d overlays, dims %dx%d vpfix %d zstrip %d z was %d f %d wr %d ds=%08x\n",
+				n, sfxScaleW, sfxScaleH, sfxW2DVpFix, sfxW2DZStripped,
+				oldZen, oldZfn, oldZwr, (unsigned int)ds2);
 		  }
 		}
 	}else
