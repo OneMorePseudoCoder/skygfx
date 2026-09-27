@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.24b) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.25) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1995,6 +1995,28 @@ sfxRTfindPush7(unsigned int callAddr)
 	return best;
 }
 
+// one-time hex dump of the shadow code regions, so the byte layout of
+// THIS exe can be checked in the log without a debugger - if these
+// bytes do not match the vanilla 1.0 US layout, the exe is modified
+// and every literal patch assumption is void
+static void
+sfxRTdump(const char *name, unsigned int start, unsigned int end)
+{
+	unsigned int a;
+	for(a = start; a < end; a += 16){
+		sfxLogLine("RT dump %s @%08x: %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X\n",
+			name, a,
+			((unsigned char*)a)[0], ((unsigned char*)a)[1],
+			((unsigned char*)a)[2], ((unsigned char*)a)[3],
+			((unsigned char*)a)[4], ((unsigned char*)a)[5],
+			((unsigned char*)a)[6], ((unsigned char*)a)[7],
+			((unsigned char*)a)[8], ((unsigned char*)a)[9],
+			((unsigned char*)a)[10], ((unsigned char*)a)[11],
+			((unsigned char*)a)[12], ((unsigned char*)a)[13],
+			((unsigned char*)a)[14], ((unsigned char*)a)[15]);
+	}
+}
+
 void
 rtshadowhooks(void)
 {
@@ -2004,6 +2026,9 @@ rtshadowhooks(void)
 	if(sfxRTShadowApplied)
 		return;
 	sfxRTShadowApplied = 1;
+	sfxRTdump("Create", 0x706460, 0x706520);
+	sfxRTdump("Init", 0x7067C0, 0x706870);
+	sfxRTdump("CamCreate", 0x705B60, 0x705B80);
 	if(res < 6) res = 6;
 	if(res > 10) res = 10;
 
