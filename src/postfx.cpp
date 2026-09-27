@@ -1643,7 +1643,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.19) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.20) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2160,7 +2160,16 @@ RenderScale_DeferredStretch(void)
 {
 	RwRaster *camR;
 	sfxStretchPending = 0;
-	camR = RwCameraGetRaster(Scene.camera);
+	// v9.20: use the REAL camera raster and un-swap the frameBuffer
+	// FIRST. v9.19 read the still-swapped 1200x676 dims raster here, so
+	// the stretch quad only covered the sub-rect 1:1 (broken looking
+	// resolution) and the copy source did not contain anything drawn
+	// during RenderEffects - which wiped the Project2DFX LOD lights
+	// that had just been drawn (correctly occluded) inside the window.
+	// Copying the real back buffer bakes scene + overlays + in-window
+	// draws into the stretched frame.
+	camR = sfxSavedFB;
+	Scene.camera->frameBuffer = camR;
 	if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
@@ -2211,9 +2220,9 @@ RenderScale_DeferredStretch(void)
 	}else
 		sfxLogLine("R2 no stretch (raster/scratch)\n");
 	// window fully closed - normal screen and raster sizes back
+	// (frameBuffer was already un-swapped at the top, v9.20)
 	RsGlobal->MaximumWidth = sfxSavedRsW;
 	RsGlobal->MaximumHeight = sfxSavedRsH;
-	Scene.camera->frameBuffer = sfxSavedFB;
 	sfxW2DNoClear = 0;
 }
 
