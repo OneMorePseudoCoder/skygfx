@@ -149,6 +149,7 @@ struct Config {
 	int shadowResolution;	// log2 of the real-time shadow raster size (vanilla 7)
 	int shadowSoftness;	// -1 = vanilla blur passes, 0 = crisp, 1..8
 	int shadowAllEntities;	// real-time shadows for every physical
+	int hdrBuffer;	// EXPERIMENTAL v9.30: scene renders into an FP16 buffer
 };
 extern int numConfigs;
 extern int currentConfig;

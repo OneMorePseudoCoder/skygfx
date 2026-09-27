@@ -1169,6 +1169,7 @@ readIni(int n)
 	c->shadowSoftness = readint(cfg.get("SkyGfx", "shadowSoftness", ""), -1);
 	if(c->shadowSoftness > 8) c->shadowSoftness = 8;
 	c->shadowAllEntities = readint(cfg.get("SkyGfx", "shadowAllEntities", ""), 0);
+	c->hdrBuffer = readint(cfg.get("SkyGfx", "hdrBuffer", ""), 0);
 	c->doglare = readint(cfg.get("SkyGfx", "sunGlare", ""), -1);
 	if(c->doglare < 0){
 		iCanHasSunGlare = false;

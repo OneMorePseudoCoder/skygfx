@@ -1622,6 +1622,7 @@ static int sfxW2DZStripped;
 static int sfxLogZ, sfxLogZ0, sfxLogDS;
 static int sfxLogQ;
 static int sfxLogB, sfxLogR;
+static int sfxLogH;
 // v9.19: the end-of-frame stretch is deferred out of RenderScale_EndOfScene
 // into the swallowed CCoronas::Render stub - see the long note in
 // RenderScale_EndOfScene. While sfxStretchPending is set the scale window
@@ -1643,7 +1644,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.29) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1652,6 +1653,113 @@ sfxLogLine(const char *fmt, ...)
 	if((++sfxLogCount % 32) == 0)
 		fflush(sfxLog);
 }
+
+// ------------------------------------------------------------------
+// v9.30: HDR scene buffer, stage 1 (opt-in: hdrBuffer = 1)
+//
+// The scene always rendered into the 8-bit back buffer, so every value
+// brighter than 1.0 was clamped before any post effect could see it.
+// Stage 1 redirects the scale window into a full-size FP16 render
+// target and resolves it back to the back buffer at the deferred
+// stretch - one hardware linear quad, the format conversion and clamp
+// happen in the sampler, so the picture is the stock one by
+// construction. The POINT of stage 1 is the plumbing; the visible
+// gains come in stage 2 when bloom/tonemap sample the FP16 data.
+// Falls back to the stock path whenever hdrBuffer = 0 (default), the
+// renderScale window is not active, the format can not be created, or
+// a device call fails (stale resource after a reset - recreated).
+// The depth stencil is kept bound across every target switch.
+// ------------------------------------------------------------------
+static void *sfxHDRtex;		// IDirect3DTexture9*, A16B16G16R16F, back buffer size
+static void *sfxHDRsurf;	// its level-0 surface
+static int sfxHDRon;		// active for this frame's scale window
+static int sfxHDRw, sfxHDRh;
+static int sfxHDRfailed;	// CreateTexture rejected the format
+static int sfxHDRresolve(RwRaster *camR);
+
+static void
+sfxHDRrelease(void)
+{
+	if(sfxHDRtex)
+		((IDirect3DTexture9*)sfxHDRtex)->Release();
+	sfxHDRtex = nil;
+	sfxHDRsurf = nil;
+}
+
+static int
+sfxHDRensure(int w, int h)
+{
+	HRESULT hr;
+	if(sfxHDRtex){
+		if(sfxHDRw == w && sfxHDRh == h)
+			return sfxHDRsurf != nil;
+		sfxHDRrelease();
+	}
+	if(sfxHDRfailed || d3d9device == nil)
+		return 0;
+	hr = d3d9device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET,
+		D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT,
+		(IDirect3DTexture9**)&sfxHDRtex, nil);
+	if(hr != D3D_OK || sfxHDRtex == nil){
+		sfxLogLine("HDR: fp16 %dx%d ABORT CreateTexture hr=%08x - feature off\n",
+			w, h, (unsigned int)hr);
+		sfxHDRfailed = 1;
+		return 0;
+	}
+	sfxHDRtex->GetSurfaceLevel(0, (IDirect3DSurface9**)&sfxHDRsurf);
+	if(sfxHDRsurf == nil){
+		sfxLogLine("HDR: GetSurfaceLevel failed - feature off\n");
+		sfxHDRrelease();
+		sfxHDRfailed = 1;
+		return 0;
+	}
+	sfxHDRw = w;
+	sfxHDRh = h;
+	sfxLogLine("HDR: fp16 %dx%d A16B16G16R16F ready\n", w, h);
+	return 1;
+}
+
+// bind the FP16 surface as render target 0, keeping the depth stencil
+// bound across the switch (SetRenderTarget alone would drop it). Cheap
+// and self-healing: shadow/env/radiosity passes bind their own targets
+// mid-scene and RW re-binds the camera raster at camera begin, so this
+// runs again from the SetViewport hook on every full-size rewrite.
+static void
+sfxHDRbind(void)
+{
+	IDirect3DSurface9 *cur = nil;
+	IDirect3DSurface9 *ds = nil;
+	HRESULT hr;
+	if(!sfxHDRon || sfxHDRsurf == nil)
+		return;
+	if(d3d9device->GetRenderTarget(0, &cur) != D3D_OK)
+		cur = nil;
+	if(cur == (IDirect3DSurface9*)sfxHDRsurf){
+		if(cur)
+			cur->Release();
+		return;
+	}
+	if(d3dGetDepthStencil)
+		d3dGetDepthStencil(d3d9device, &ds);
+	hr = d3d9device->SetRenderTarget(0, (IDirect3DSurface9*)sfxHDRsurf);
+	if(ds){
+		d3d9device->SetDepthStencilSurface(ds);
+		ds->Release();
+	}
+	if(cur){
+		cur->Release();
+		if(hr == D3D_OK){
+			if(sfxLogH++ < 16)
+				sfxLogLine("H bind -> fp16\n");
+		}else{
+			// stale resource after a device reset - drop and recreate
+			sfxLogLine("H bind FAILED hr=%08x - recreating\n", (unsigned int)hr);
+			sfxHDRrelease();
+			sfxHDRon = 0;
+		}
+	}
+}
+
 
 // diagnostics only: the projection matrix itself is never modified (the
 // viewport clamp below is the entire fix) - we just record what the game
@@ -1673,6 +1781,7 @@ sfxSetTransformHook(void *dev, int type, void *m)
 				d3dSetViewportOrig(dev, &c);
 				sfxLogLine("P reassert %ux%u\n", sfxScaleW, sfxScaleH);
 			}
+			sfxHDRbind();
 		}else if(sfxLogT0++ < 8)
 			sfxLogLine("T0 proj win=0\n");
 	}else if(sfxLogOther++ < 6)
@@ -1701,6 +1810,7 @@ sfxSetViewportHook(void *dev, void *vp)
 				sfxLogLine("%c vp=%ux%u -> %ux%u\n",
 					sfxScaleInScene ? 'C' : 'H',
 					v->width, v->height, c.width, c.height);
+			sfxHDRbind();
 			return d3dSetViewportOrig(dev, &c);
 		}
 		if(sfxLogS++ < 8)
@@ -2216,6 +2326,16 @@ RenderScale_Begin(void)
 	d3dSetViewportOrig(d3d9device, &vp);
 	sfxVpScaled = 1;
 	sfxScaleInScene = 1;
+	sfxHDRon = 0;
+	if(config->hdrBuffer){
+		if(sfxHDRensure(camR->width, camR->height)){
+			sfxHDRon = 1;
+			sfxHDRbind();
+			if(sfxLogH++ < 8)
+				sfxLogLine("H begin: scene window -> fp16 %dx%d\n", sfxHDRw, sfxHDRh);
+		}else
+			sfxLogLine("H begin: fp16 unavailable - stock path\n");
+	}
 	if(sfxLogB++ < 40)
 		sfxLogLine("B begin: scale=%.2f raster=%ux%u vp=%ux%u -> force %dx%d\n",
 			s, sfxSceneW, sfxSceneH, sfxVpFull.width, sfxVpFull.height, w, h);
@@ -2367,6 +2487,8 @@ RenderScale_EndOfScene(void)
 		return;
 	}else
 		sfxW2DNoClear = 0;
+	if(sfxHDRon && sfxHDRresolve(camR))
+		return;
 	// 1:1 copy of the frame into the scratch raster (the camera raster is
 	// the back buffer and can not be sampled as a texture - that was the
 	// v9.1 white screen)
@@ -2409,6 +2531,86 @@ RenderScale_EndOfScene(void)
 			sfxScaleW, sfxScaleH, camR->width, camR->height);
 }
 
+// v9.30: resolve the FP16 scene buffer into the back buffer - one
+// hardware linear quad (the same geometry the stock path draws from
+// the scratch raster), so the FP16 -> 8-bit conversion happens in the
+// sampler and the picture is the stock one by construction. Runs
+// outside the RW update context (between EndUpdate and BeginUpdate)
+// with plain D3D9; the device states it changes are restored.
+static int
+sfxHDRresolve(RwRaster *camR)
+{
+	struct HDRVtx { float x, y, z, rhw, u, v; } v[4];
+	IDirect3DSurface9 *bb = nil, *ds = nil;
+	DWORD oldZen = 0, oldCull = 0, oldBlend = 0;
+	HRESULT hr;
+	float uw, vh;
+	int i;
+	if(d3d9device == nil || sfxHDRsurf == nil || camR == nil)
+		return 0;
+	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
+		|| bb == nil)
+		return 0;
+	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
+	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
+	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
+	// full viewport first - the quad is placed in full-raster coordinates
+	struct SfxD3DViewport fullvp = {0, 0, (unsigned int)camR->width, (unsigned int)camR->height, 0.0f, 1.0f};
+	if(d3dSetViewportOrig)
+		d3dSetViewportOrig(d3d9device, &fullvp);
+	sfxVpScaled = 0;
+	sfxScaleActive = 0;
+	sfxScaleInScene = 0;
+	RwCameraEndUpdate(Scene.camera);
+	if(d3dGetDepthStencil)
+		d3dGetDepthStencil(d3d9device, &ds);
+	hr = d3d9device->SetRenderTarget(0, bb);
+	bb->Release();
+	if(ds){
+		d3d9device->SetDepthStencilSurface(ds);
+		ds->Release();
+	}
+	if(hr != D3D_OK){
+		RwCameraBeginUpdate(Scene.camera);
+		sfxLogLine("H2 resolve ABORT SetRenderTarget hr=%08x - stock path\n", (unsigned int)hr);
+		sfxHDRrelease();
+		sfxHDRon = 0;
+		return 0;
+	}
+	d3d9device->SetRenderState(D3DRS_ZENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	d3d9device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+	d3d9device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	d3d9device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+	d3d9device->SetTexture(0, (IDirect3DTexture9*)sfxHDRtex);
+	d3d9device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+	uw = (float)sfxScaleW / (float)sfxHDRw;
+	vh = (float)sfxScaleH / (float)sfxHDRh;
+	v[0].x = -0.5f;	v[0].y = -0.5f;	v[0].u = 0.0f;	v[0].v = 0.0f;
+	v[1].x = (float)camR->width - 0.5f;	v[1].y = -0.5f;	v[1].u = uw;	v[1].v = 0.0f;
+	v[2].x = -0.5f;	v[2].y = (float)camR->height - 0.5f;	v[2].u = 0.0f;	v[2].v = vh;
+	v[3].x = (float)camR->width - 0.5f;	v[3].y = (float)camR->height - 0.5f;	v[3].u = uw;	v[3].v = vh;
+	for(i = 0; i < 4; i++){
+		v[i].z = 0.0f;
+		v[i].rhw = 1.0f;
+	}
+	d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(struct HDRVtx));
+	// detach the FP16 texture again and restore what was switched off;
+	// RW re-issues its own state on the next camera/draw cycle
+	d3d9device->SetTexture(0, nil);
+	d3d9device->SetRenderState(D3DRS_ZENABLE, oldZen);
+	d3d9device->SetRenderState(D3DRS_CULLMODE, oldCull);
+	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, oldBlend);
+	RwCameraBeginUpdate(Scene.camera);
+	if(sfxLogR++ < 40)
+		sfxLogLine("H2 resolve fp16 %ux%u -> %ux%u @coronas\n",
+			sfxScaleW, sfxScaleH, camR->width, camR->height);
+	return 1;
+}
+
 // v9.19: the deferred end-of-frame stretch. Runs from the swallowed
 // CCoronas::Render stub inside RenderEffects - after CMovingThings::Render
 // (Project2DFX LOD lights) and before the fx/HUD draws that need the full
@@ -2428,7 +2630,10 @@ RenderScale_DeferredStretch(void)
 	// draws into the stretched frame.
 	camR = sfxSavedFB;
 	Scene.camera->frameBuffer = camR;
-	if(camR != nil && (sfxStretchRaster != nil
+	if(sfxHDRon && sfxHDRresolve(camR)){
+		// resolved straight from the FP16 buffer; the RsGlobal and
+		// NoClear cleanup at the end of this function is shared
+	}else if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
 		// full-raster coordinates
