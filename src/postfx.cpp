@@ -1752,7 +1752,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30l) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30l2) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2902,7 +2902,7 @@ RenderScale_DeferredStretch(void)
 		  if(ufr++ < 20)
 			  sfxLogLine("R2 fbrefresh after resolve\n");
 		}
-		sfxFBSig(pRasterFrontBuffer, "RS", &sfxSigBurstRS);
+		sfxFBSig(CPostEffects::pRasterFrontBuffer, "RS", &sfxSigBurstRS);
 	}else if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
