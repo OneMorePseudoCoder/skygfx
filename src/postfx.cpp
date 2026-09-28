@@ -208,7 +208,7 @@ sfxBBtoFB(int w, int h)
 	D3DSURFACE_DESC d;
 	D3DLOCKED_RECT lr;
 	RwUInt8 *dst;
-	int y;
+	int y, cw, ch;
 	if(dev == nil || CPostEffects::pRasterFrontBuffer == nil || w <= 0 || h <= 0)
 		return 0;
 	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
@@ -236,15 +236,24 @@ sfxBBtoFB(int w, int h)
 		return 0;
 	}
 	bb->Release();
-	if(sfxLiveRaster == nil || sfxLiveW != w || sfxLiveH != h){
+	// v9.33: the front-buffer raster and the swap chain can DIFFER in
+	// size (the 932 run showed a 2048x1024 front raster on a 1600x900
+	// swap chain). Copy only the intersection - reading the source
+	// beyond the back-buffer-sized system copy was the v9.32a crash
+	// (fault registers: row stride 0x2000 = 2048px, 0x400 = 1024 rows).
+	cw = d.Width < w ? d.Width : w;
+	ch = d.Height < h ? d.Height : h;
+	if(cw <= 0 || ch <= 0)
+		return 0;
+	if(sfxLiveRaster == nil || sfxLiveW != cw || sfxLiveH != ch){
 		if(sfxLiveRaster)
 			RwRasterDestroy(sfxLiveRaster);
 		sfxLiveRaster = nil;
-		sfxLiveRaster = RwRasterCreate(w, h, 32, rwRASTERTYPECAMERATEXTURE);
+		sfxLiveRaster = RwRasterCreate(cw, ch, 32, rwRASTERTYPECAMERATEXTURE);
 		if(sfxLiveRaster == nil)
 			return 0;
-		sfxLiveW = w;
-		sfxLiveH = h;
+		sfxLiveW = cw;
+		sfxLiveH = ch;
 	}
 	if(sfxSysCopy->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK)
 		return 0;
@@ -253,8 +262,8 @@ sfxBBtoFB(int w, int h)
 		sfxSysCopy->UnlockRect();
 		return 0;
 	}
-	for(y = 0; y < h; y++)
-		memcpy(dst + y*w*4, (RwUInt8*)lr.pBits + y*lr.Pitch, w*4);
+	for(y = 0; y < ch; y++)
+		memcpy(dst + y*cw*4, (RwUInt8*)lr.pBits + y*lr.Pitch, cw*4);
 	RwRasterUnlock(sfxLiveRaster);
 	sfxSysCopy->UnlockRect();
 	RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
@@ -275,10 +284,24 @@ CPostEffects::UpdateFrontBuffer(void)
 	// system copy of it (the frozen beige). Fill the front buffer from
 	// the live back buffer instead. Radiosity ping-pong copies (camera
 	// on workBuffer) and hdrBuffer=0 take the stock path unchanged.
+	// v9.33: belt and suspenders - any fault in the copy path falls
+	// back to the stock copy and disables the live path for good, so
+	// the worst case is the old behaviour, never a crash.
 	if(sfxHDRready && sfxBBRaster != nil
-		&& RwCameraGetRaster(Scene.camera) == sfxBBRaster
-		&& sfxBBtoFB(pRasterFrontBuffer->width, pRasterFrontBuffer->height))
-		return;
+		&& RwCameraGetRaster(Scene.camera) == sfxBBRaster){
+		int ok = 0;
+		__try{
+			ok = sfxBBtoFB(pRasterFrontBuffer->width, pRasterFrontBuffer->height);
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER){
+			ok = 0;
+			sfxHDRready = 0;
+			if(sfxLog)
+				fprintf(sfxLog, "U2 live copy faulted - stock path from now on\n");
+		}
+		if(ok)
+			return;
+	}
 	// v9.30k: WHICH raster is the camera holding when the filter chain
 	// refreshes its front buffer? The colour filter / radiosity chain
 	// samples this raster, and with hdrBuffer the camera raster can
@@ -1810,7 +1833,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.32a) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.33) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
