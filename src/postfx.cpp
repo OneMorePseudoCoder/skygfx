@@ -289,9 +289,16 @@ CPostEffects::UpdateFrontBuffer(void)
 	// the worst case is the old behaviour, never a crash.
 	if(sfxHDRready && sfxBBRaster != nil
 		&& RwCameraGetRaster(Scene.camera) == sfxBBRaster){
+		// v9.34: the full readback runs ONCE per frame (the first
+		// UpdateFrontBuffer with the camera on the swap chain); later
+		// calls in the same frame skip - the fill persists for the
+		// frame. 2-3 full readbacks per frame were the v9.33 FPS drop.
+		static int filledAt = -1;
 		int ok = 0;
+		if(filledAt == sfxProbeFrame)
+			return;
 		__try{
-			ok = sfxBBtoFB(pRasterFrontBuffer->width, pRasterFrontBuffer->height);
+			ok = sfxBBtoFB(CPostEffects::pRasterFrontBuffer->width, CPostEffects::pRasterFrontBuffer->height);
 		}
 		__except(EXCEPTION_EXECUTE_HANDLER){
 			ok = 0;
@@ -299,8 +306,13 @@ CPostEffects::UpdateFrontBuffer(void)
 			if(sfxLog)
 				fprintf(sfxLog, "U2 live copy faulted - stock path from now on\n");
 		}
+		filledAt = sfxProbeFrame;
 		if(ok)
 			return;
+		if(sfxLog && sfxLogU2 < 16){
+			sfxLogU2++;
+			fprintf(sfxLog, "U2 live fill FAILED - stock copy this frame\n");
+		}
 	}
 	// v9.30k: WHICH raster is the camera holding when the filter chain
 	// refreshes its front buffer? The colour filter / radiosity chain
@@ -1833,7 +1845,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.33) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.34) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2587,6 +2599,12 @@ sfxProbeBackBuffer(void)
 	int i, mn = 255, mx = 0, sum = 0, v;
 	if(dev == nil)
 		return;
+	// v9.34: sample every 2nd frame - freeze episodes last many
+	// frames, a 2-frame grid still catches them, at half the cost.
+	if((sfxProbeFrame & 1) != 0){
+		sfxProbeFrame++;
+		return;
+	}
 	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || bb == nil)
 		return;
 	if(bb->GetDesc(&d) != D3D_OK ||
@@ -2624,6 +2642,19 @@ sfxProbeBackBuffer(void)
 	else					v = 0;
 	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : "";
 	fs = "";
+	// v9.34: at any non-normal verdict, identify the filter chain's
+	// input raster - pointer, size, and whether the engage gate holds.
+	// Catches the live path silently dropping to the stale stock copy
+	// mid-episode. Cheap: no readback.
+	if(v != 0 && sfxProbeBudget-- > 0)
+		sfxLogLine("PROBE FBX f=%u pf=%d fb=%08x %dx%d cam==bb:%d\n",
+			sfxFrameNo, sfxProbeFrame,
+			(unsigned int)(void*)CPostEffects::pRasterFrontBuffer,
+			CPostEffects::pRasterFrontBuffer != nil
+				? CPostEffects::pRasterFrontBuffer->width : 0,
+			CPostEffects::pRasterFrontBuffer != nil
+				? CPostEffects::pRasterFrontBuffer->height : 0,
+			RwCameraGetRaster(Scene.camera) == sfxBBRaster);
 	// frozen output: identical hash on consecutive frames while the
 	// game is running. Only meaningful while the camera is moving;
 	// throttled to one line per four repeats.
@@ -2676,6 +2707,10 @@ sfxProbeResolveBB(void)
 	int i, mn = 255, mx = 0, sum = 0, v;
 	const char *vs;
 	if(dev == nil || sfxProbeBudget <= 0)
+		return;
+	// v9.34: every 4th frame (BB advances sfxProbeFrame by 2 per
+	// sample, so this lands once per two BB samples).
+	if((sfxProbeFrame & 3) != 2)
 		return;
 	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || bb == nil)
 		return;
@@ -2753,7 +2788,7 @@ sfxProbeFP16(void)
 	if(dev == nil || src == nil)
 		return;
 	sfxProbeGame = 1;		// resolve runs -> gameplay frames
-	if((sfxProbeFrame % 10) != 0)
+	if((sfxProbeFrame % 20) != 0)
 		return;
 	if(src->GetDesc(&d) != D3D_OK ||
 	   dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
