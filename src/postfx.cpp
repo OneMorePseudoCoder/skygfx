@@ -1645,7 +1645,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30f2) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30g) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1688,10 +1688,9 @@ static int sfxHDRresolve(RwRaster *camR);
 // FP16 sub-rect, so the pre-window sky lands exactly where the
 // resolve stretches it back - vanilla "nothing is ever cleared"
 // semantics, no game bytes touched.
-static void *sfxBBcopyTex;	// IDirect3DTexture9*, A8R8G8B8, back buffer size
-static int sfxLogCap;	// v9.30f2: capture log cap (sfxLogS is taken, C2086)
+static int sfxLogCap;	// v9.30g: sky-call log cap (sfxLogS is taken, C2086)
 static void sfxHDRclearFull(void);
-static int sfxHDRcaptureBB(void);
+static void sfxSkyDraw(const struct SfxD3DViewport *svp);
 
 static void
 sfxHDRrelease(void)
@@ -1700,9 +1699,6 @@ sfxHDRrelease(void)
 		((IDirect3DTexture9*)sfxHDRtex)->Release();
 	sfxHDRtex = nil;
 	sfxHDRsurf = nil;
-	if(sfxBBcopyTex)
-		((IDirect3DTexture9*)sfxBBcopyTex)->Release();
-	sfxBBcopyTex = nil;
 }
 
 static int
@@ -1734,15 +1730,6 @@ sfxHDRensure(int w, int h)
 	}
 	sfxHDRw = w;
 	sfxHDRh = h;
-	// v9.30f: back buffer copy texture for the sky capture; failure is
-	// not fatal - the flat clear remains as the fallback
-	if(sfxBBcopyTex == nil
-			&& d3d9device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET,
-				D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
-				(IDirect3DTexture9**)&sfxBBcopyTex, nil) != D3D_OK){
-		sfxBBcopyTex = nil;
-		sfxLogLine("HDR: bb copy texture failed - sky falls back to flat clear\n");
-	}
 	sfxLogLine("HDR: fp16 %dx%d A16B16G16R16F ready\n", w, h);
 	return 1;
 }
@@ -2344,69 +2331,24 @@ sfxHDRclearFull(void)
 	d3d9device->Clear(0, nil, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
 }
 
-// v9.30f: copy the current back buffer content - the pre-window sky
-// (gradient, clouds, stars, sun/moon) - into the FP16 buffer's
-// sub-rect. StretchRect BB -> A8R8G8B8 RT texture, then one XYZRHW
-// quad sampling the whole copy: sub-rect pixel (x, y) receives the
-// back buffer pixel scaled down by sfxScale - exactly the position
-// the resolve later stretches it back from. The device viewport must
-// be FULL on entry (it is: SetRenderTarget in bind resets it) and the
-// caller re-asserts the scaled viewport afterwards. Returns 0 on any
-// failure - the caller falls back to the flat clear.
-static int
-sfxHDRcaptureBB(void)
+// v9.30g: the sky, drawn the vanilla way, into the FP16 sub-rect.
+// CClouds::Render (0x713950) projects its vertices through the CURRENT
+// viewport, so with the scaled viewport set the gradient, clouds,
+// stars and sun land in exactly the coordinate space the world
+// renders into - and vanilla calls the same function right before
+// RenderScene anyway (to the back buffer; that copy still happens and
+// is harmless - the resolve overwrites it). No game bytes are
+// patched; the black clear runs first so frames where the sky
+// early-outs (interiors, no-sky cameras) get the v9.30d behaviour
+// instead of stale content.
+static void
+sfxSkyDraw(const struct SfxD3DViewport *svp)
 {
-	IDirect3DSurface9 *bb = nil, *dst = nil;
-	HRESULT hr;
-	DWORD oldZen = 0, oldCull = 0, oldBlend = 0;
-	struct SfxD3DViewport full = {0, 0, (unsigned int)sfxHDRw, (unsigned int)sfxHDRh, 0.0f, 1.0f};
-	struct SfxBBVtx { float x, y, z, rhw, u, v; } v[4];
-	int i;
-	if(sfxBBcopyTex == nil || d3d9device == nil || sfxHDRsurf == nil)
-		return 0;
-	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || bb == nil)
-		return 0;
-	hr = ((IDirect3DTexture9*)sfxBBcopyTex)->GetSurfaceLevel(0, &dst);
-	if(hr != D3D_OK || dst == nil){
-		bb->Release();
-		return 0;
-	}
-	hr = d3d9device->StretchRect(bb, nil, dst, nil, D3DTEXF_LINEAR);
-	dst->Release();
-	bb->Release();
-	if(hr != D3D_OK){
-		if(sfxLogCap++ < 2000)
-			sfxLogLine("S capture StretchRect FAILED hr=%08x - flat clear fallback\n", (unsigned int)hr);
-		return 0;
-	}
-	d3dSetViewportOrig(d3d9device, &full);
-	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
-	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
-	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
-	d3d9device->SetRenderState(D3DRS_ZENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-	d3d9device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-	d3d9device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-	d3d9device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-	d3d9device->SetTexture(0, (IDirect3DTexture9*)sfxBBcopyTex);
-	d3d9device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-	v[0].x = -0.5f;	v[0].y = -0.5f;	v[0].u = 0.0f;	v[0].v = 0.0f;
-	v[1].x = (float)sfxScaleW - 0.5f;	v[1].y = -0.5f;	v[1].u = 1.0f;	v[1].v = 0.0f;
-	v[2].x = -0.5f;	v[2].y = (float)sfxScaleH - 0.5f;	v[2].u = 0.0f;	v[2].v = 1.0f;
-	v[3].x = (float)sfxScaleW - 0.5f;	v[3].y = (float)sfxScaleH - 0.5f;	v[3].u = 1.0f;	v[3].v = 1.0f;
-	for(i = 0; i < 4; i++){
-		v[i].z = 0.0f;
-		v[i].rhw = 1.0f;
-	}
-	d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(struct SfxBBVtx));
-	d3d9device->SetTexture(0, nil);
-	d3d9device->SetRenderState(D3DRS_ZENABLE, oldZen);
-	d3d9device->SetRenderState(D3DRS_CULLMODE, oldCull);
-	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, oldBlend);
-	return 1;
+	sfxHDRclearFull();
+	d3dSetViewportOrig(d3d9device, svp);
+	((void (*)(void))0x713950)();	// CClouds::Render - vanilla order, retargeted
+	if(sfxLogCap++ < 2000)
+		sfxLogLine("SKY drawn into fp16 sub-rect (vanilla fn, no patches)\n");
 }
 
 void
@@ -2459,28 +2401,17 @@ RenderScale_Begin(void)
 		if(sfxHDRensure(camR->width, camR->height)){
 			sfxHDRon = 1;
 			sfxHDRbind();
-			// v9.30f: instead of wiping the FP16 buffer (v9.30d: flat
-			// black sky) or rerouting the sky draw call (v9.30e: the
-			// Idle region is already rewritten by other ASI mods -
-			// hook NOT FOUND), capture what the game drew to the back
-			// buffer BEFORE this window opened: the sky gradient,
-			// clouds, stars and sun/moon (SA never colour-clears the
-			// main camera, "Zc f=6"). The copy lands in the sub-rect
-			// exactly where the resolve picks it back up.
-			if(sfxHDRcaptureBB()){
-				if(sfxLogCap++ < 2000)
-					sfxLogLine("S capture bb -> fp16 (sub-rect)\n");
-			}else{
-				sfxHDRclearFull();
-				if(sfxLogCap++ < 2000)
-					sfxLogLine("S capture unavailable - flat clear fallback\n");
-			}
+			// v9.30g: black clear + the game's own sky, straight into
+			// the sub-rect (see sfxSkyDraw). Replaces the v9.30d flat
+			// black (ate the real sky) and the v9.30f back buffer
+			// capture (fed the PREVIOUS frame back in - the sky washed
+			// toward white and stale content bled through the holes of
+			// alpha-tested world geometry: the "roblox" look).
+			sfxSkyDraw(&vp);
 			// v9.30f CRITICAL: re-assert the SCALED viewport here.
-			// SetRenderTarget (bind) and the capture both leave the
-			// FULL viewport on the device; v9.30e restored whatever
-			// GetViewport returned - the full one - so the scene drew
-			// unscaled while the resolve still cut the sub-rect out
-			// of it: the zoomed, off-centre frame. v9.30d did this.
+			// SetRenderTarget (bind) and the full-viewport clear leave
+			// the FULL one on the device; the sky call needs the
+			// scaled one (v9.30e lesson).
 			d3dSetViewportOrig(d3d9device, &vp);
 			if(sfxLogH++ < 2000)
 				sfxLogLine("H begin: scene window -> fp16 %dx%d\n", sfxHDRw, sfxHDRh);
