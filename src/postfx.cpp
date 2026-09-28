@@ -1221,6 +1221,62 @@ CPostEffects::Grain_PS2(int strength, bool generate)
 static int sfxLogCF;
 static void sfxLogLine(const char *fmt, ...);
 
+// v9.30l: content signature of a raster - lock level 0 and hash the first
+// pixels plus min/max. The PS2 filter chain input turning uniform white
+// (mn==mx, high) is the white-frame marker this build hunts for. Normal
+// frames stay silent; uniform/white/black frames and short calibration
+// windows print, throttled per burst.
+// (sfxFrameNo moved up here in v9.30l - the signature helper below uses it)
+static unsigned int sfxFrameNo;
+static int sfxSigBudget;
+static int sfxSigBurstCF;
+static int sfxSigBurstRS;
+static int sfxSigBurstDFE;
+static void
+sfxFBSig(RwRaster *r, const char *tag, int *burst)
+{
+	RwUInt8 *p;
+	unsigned int s = 0;
+	int i, mn = 255, mx = 0;
+	int uniform, white, black;
+	if(r == nil || sfxSigBudget >= 2500)
+		return;
+	p = RwRasterLock(r, 0, 1);
+	if(p == nil){
+		if(sfxSigBudget < 2500){
+			sfxLogLine("SIG %s f=%u lockfail\n", tag, sfxFrameNo);
+			sfxSigBudget += 16;
+		}
+		return;
+	}
+	for(i = 0; i < 64; i++){
+		int v = p[i*4];
+		s = s*31 + (unsigned int)v;
+		if(v > mx) mx = v;
+		if(v < mn) mn = v;
+	}
+	uniform = (mx - mn) < 12;
+	white = uniform && mn > 239;
+	black = uniform && mn < 6;
+	if(white || black){
+		(*burst)++;
+		if(*burst != 1 && (*burst % 8) != 0){
+			RwRasterUnlock(r);
+			return;
+		}
+	}else
+		*burst = 0;
+	if(!white && !black && (int)sfxFrameNo >= 10 && (sfxFrameNo & 255) != 0){
+		RwRasterUnlock(r);
+		return;
+	}
+	sfxSigBudget++;
+	sfxLogLine("SIG %s f=%u %08x mn=%d mx=%d r0=%02x%02x%02x%02x mid=%02x%02x%02x%02x\n",
+		tag, sfxFrameNo, s, mn, mx,
+		p[0], p[1], p[2], p[3], p[25600], p[25601], p[25602], p[25603]);
+	RwRasterUnlock(r);
+}
+
 void
 CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 {
@@ -1261,6 +1317,7 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 		static RwRaster *lastFB;
 		static int lastW, lastH;
 		RwRaster *fb = pRasterFrontBuffer;
+		sfxFBSig(fb, "CF", &sfxSigBurstCF);
 		int w = fb ? RwRasterGetWidth(fb) : 0;
 		int h = fb ? RwRasterGetHeight(fb) : 0;
 		if(fb != lastFB || w != lastW || h != lastH){
@@ -1695,7 +1752,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30k) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30l) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1739,8 +1796,7 @@ static int sfxHDRresolve(RwRaster *camR);
 // resolve stretches it back - vanilla "nothing is ever cleared"
 // semantics, no game bytes touched.
 static int sfxLogCap;	// v9.30g: sky-call log cap (sfxLogS is taken, C2086)
-// v9.30i blink/shadow diagnostics: frame counter + per-stream line budgets
-static unsigned int sfxFrameNo;
+// v9.30i blink/shadow diagnostics: (sfxFrameNo lives with the v9.30l sig helper)
 static int sfxLogXF;
 static int sfxLogDFE;
 static int sfxLogVP;
@@ -2713,6 +2769,32 @@ sfxHDRresolve(RwRaster *camR)
 	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 		|| bb == nil)
 		return 0;
+	// v9.30l: what does the FP16 buffer actually contain? Sampled raw
+	// (A16B16G16R16F = 8 bytes/px); calibration + uniform frames only.
+	{ static int fpsig = 0;
+	  if(fpsig < 50 && ((int)sfxFrameNo < 6 || (sfxFrameNo & 63) == 0)
+		  && sfxHDRsurf != nil){
+		  D3DLOCKED_RECT lr;
+		  if(((IDirect3DSurface9*)sfxHDRsurf)->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
+			  unsigned char *q = (unsigned char*)lr.pBits;
+			  unsigned int s = 0;
+			  int i, mn = 32767, mx = -32768;
+			  for(i = 0; i < 32; i++){
+				  int v = (int)(unsigned short)(q[i*8] | (q[i*8+1] << 8));
+				  s = s*31 + (unsigned int)v;
+				  if(v > mx) mx = v;
+				  if(v < mn) mn = v;
+			  }
+			  fpsig++;
+			  sfxLogLine("SIG FP16 f=%u %08x %d..%d %02x%02x %02x%02x\n",
+				  sfxFrameNo, s, mn, mx, q[0], q[1], q[6400], q[6401]);
+			  ((IDirect3DSurface9*)sfxHDRsurf)->UnlockRect();
+		  }else{
+			  fpsig = 50;
+			  sfxLogLine("SIG FP16 lockfail\n");
+		  }
+	  }
+	}
 	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
 	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
 	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
@@ -2820,6 +2902,7 @@ RenderScale_DeferredStretch(void)
 		  if(ufr++ < 20)
 			  sfxLogLine("R2 fbrefresh after resolve\n");
 		}
+		sfxFBSig(pRasterFrontBuffer, "RS", &sfxSigBurstRS);
 	}else if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
@@ -2942,6 +3025,7 @@ CPostEffects::DrawFinalEffects(void)
 
 	// scene, after all game post effects, into the front buffer
 	UpdateFrontBuffer();
+	sfxFBSig(pRasterFrontBuffer, "DFE", &sfxSigBurstDFE);
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
