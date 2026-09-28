@@ -1645,7 +1645,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30f) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30f2) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1689,7 +1689,7 @@ static int sfxHDRresolve(RwRaster *camR);
 // resolve stretches it back - vanilla "nothing is ever cleared"
 // semantics, no game bytes touched.
 static void *sfxBBcopyTex;	// IDirect3DTexture9*, A8R8G8B8, back buffer size
-static int sfxLogS;
+static int sfxLogCap;	// v9.30f2: capture log cap (sfxLogS is taken, C2086)
 static void sfxHDRclearFull(void);
 static int sfxHDRcaptureBB(void);
 
@@ -2375,7 +2375,7 @@ sfxHDRcaptureBB(void)
 	dst->Release();
 	bb->Release();
 	if(hr != D3D_OK){
-		if(sfxLogS++ < 2000)
+		if(sfxLogCap++ < 2000)
 			sfxLogLine("S capture StretchRect FAILED hr=%08x - flat clear fallback\n", (unsigned int)hr);
 		return 0;
 	}
@@ -2468,11 +2468,11 @@ RenderScale_Begin(void)
 			// main camera, "Zc f=6"). The copy lands in the sub-rect
 			// exactly where the resolve picks it back up.
 			if(sfxHDRcaptureBB()){
-				if(sfxLogS++ < 2000)
+				if(sfxLogCap++ < 2000)
 					sfxLogLine("S capture bb -> fp16 (sub-rect)\n");
 			}else{
 				sfxHDRclearFull();
-				if(sfxLogS++ < 2000)
+				if(sfxLogCap++ < 2000)
 					sfxLogLine("S capture unavailable - flat clear fallback\n");
 			}
 			// v9.30f CRITICAL: re-assert the SCALED viewport here.
