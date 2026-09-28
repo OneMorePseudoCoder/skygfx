@@ -198,125 +198,124 @@ sfxBBRegister(RwRaster *camR)
 	sfxBBRaster = camR;
 }
 
-// back buffer -> front buffer, all-GPU edition (v9.35). StretchRect
-// the back buffer into our own render-target texture, then draw it
-// 1:1 into the front-buffer raster through RW's own push context -
-// the same structure as the vanilla copy, just with a live source
-// and no CPU round-trip. The vanilla RwRasterRenderFast from the
-// camera raster is poisoned on this machine: RW serves its own stale
-// system copy of that back-buffer-backed raster (the frozen warm
-// image that fed the whole colour chain).
-static IDirect3DTexture9 *sfxCopyTex;
-static int sfxCopyW, sfxCopyH;
-static int
-sfxGPUfillFB(void)
+// back buffer -> front buffer. Readback: GetRenderTargetData into a
+// SYSTEMMEM copy (legal, one-way), upload into our own texture raster
+// (lock/unlock - the proven dither pattern), then write the front
+// buffer through the VANILLA path (PushContext + RwRasterRenderFast)
+// - the same write the stock copy uses, just fed with live pixels.
+// The v9.35 raw-D3D quad write was reverted: it corrupted pause-menu
+// rendering (screenshot 79). The CPU readback is cached once per
+// frame (9.34a proved that costs nothing measurable; the v9.33 drop
+// was 2-3 readbacks per frame).
+static IDirect3DSurface9 *sfxSysCopy;
+static int sfxSysW, sfxSysH;
+static RwRaster *sfxLiveRaster;
+static int sfxLiveW, sfxLiveH;
+static int sfxLogU2;
+static int sfxLiveFilledAt = -1;
+
+static void
+sfxLiveUpload(void)
 {
 	IDirect3DDevice9 *dev = d3d9device;
-	IDirect3DSurface9 *bb = nil, *dst = nil;
+	IDirect3DSurface9 *bb = nil;
 	D3DSURFACE_DESC d;
-	DWORD z = 0, c = 0, bl = 0;
-	struct { float x, y, z, rhw, u, v; } v[4];
-	int cw, ch, i;
-	if(dev == nil || CPostEffects::pRasterFrontBuffer == nil)
-		return 0;
+	D3DLOCKED_RECT lr;
+	RwUInt8 *dst;
+	int y, cw, ch;
+	if(dev == nil)
+		return;
 	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 		|| bb == nil)
-		return 0;
+		return;
 	if(bb->GetDesc(&d) != D3D_OK){
 		bb->Release();
-		return 0;
+		return;
 	}
-	if(sfxCopyTex == nil || sfxCopyW != (int)d.Width || sfxCopyH != (int)d.Height){
-		if(sfxCopyTex){
-			sfxCopyTex->Release();
-			sfxCopyTex = nil;
-		}
-		if(dev->CreateTexture(d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET,
-			d.Format, D3DPOOL_DEFAULT, &sfxCopyTex, nil) != D3D_OK){
+	if(sfxSysCopy == nil || sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
+		if(sfxSysCopy)
+			sfxSysCopy->Release();
+		sfxSysCopy = nil;
+		if(dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+			D3DPOOL_SYSTEMMEM, &sfxSysCopy, nil) != D3D_OK){
+			sfxSysCopy = nil;
 			bb->Release();
-			return 0;
+			return;
 		}
-		sfxCopyW = (int)d.Width;
-		sfxCopyH = (int)d.Height;
+		sfxSysW = (int)d.Width;
+		sfxSysH = (int)d.Height;
 	}
-	if(sfxCopyTex->GetSurfaceLevel(0, &dst) != D3D_OK || dst == nil){
+	if(dev->GetRenderTargetData(bb, sfxSysCopy) != D3D_OK){
 		bb->Release();
-		return 0;
+		return;
 	}
-	if(dev->StretchRect(bb, nil, dst, nil, D3DTEXF_NONE) != D3D_OK){
-		dst->Release();
-		bb->Release();
-		return 0;
-	}
-	dst->Release();
 	bb->Release();
-	// copy only the intersection of the swap chain and the front
-	// raster (the front raster can be 2048x1024 on a 1600x900 swap
-	// chain on this machine - the v9.33 lesson)
-	cw = sfxCopyW < CPostEffects::pRasterFrontBuffer->width
-		? sfxCopyW : CPostEffects::pRasterFrontBuffer->width;
-	ch = sfxCopyH < CPostEffects::pRasterFrontBuffer->height
-		? sfxCopyH : CPostEffects::pRasterFrontBuffer->height;
-	if(cw <= 0 || ch <= 0)
-		return 0;
-	RwCameraEndUpdate(Scene.camera);
-	RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
-	dev->GetRenderState(D3DRS_ZENABLE, &z);
-	dev->GetRenderState(D3DRS_CULLMODE, &c);
-	dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &bl);
-	dev->SetRenderState(D3DRS_ZENABLE, FALSE);
-	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-	dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-	dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-	v[0].x = -0.5f;    v[0].y = -0.5f;    v[0].u = 0.0f; v[0].v = 0.0f;
-	v[1].x = cw - 0.5f; v[1].y = -0.5f;    v[1].u = 1.0f; v[1].v = 0.0f;
-	v[2].x = -0.5f;    v[2].y = ch - 0.5f; v[2].u = 0.0f; v[2].v = 1.0f;
-	v[3].x = cw - 0.5f; v[3].y = ch - 0.5f; v[3].u = 1.0f; v[3].v = 1.0f;
-	for(i = 0; i < 4; i++){
-		v[i].z = 0.0f;
-		v[i].rhw = 1.0f;
+	if(sfxLiveRaster == nil || sfxLiveW != sfxSysW || sfxLiveH != sfxSysH){
+		if(sfxLiveRaster)
+			RwRasterDestroy(sfxLiveRaster);
+		sfxLiveRaster = nil;
+		sfxLiveRaster = RwRasterCreate(sfxSysW, sfxSysH, 32,
+			rwRASTERTYPECAMERATEXTURE);
+		if(sfxLiveRaster == nil)
+			return;
+		sfxLiveW = sfxSysW;
+		sfxLiveH = sfxSysH;
 	}
-	dev->SetTexture(0, sfxCopyTex);
-	dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(v));
-	dev->SetTexture(0, nil);
-	dev->SetRenderState(D3DRS_ZENABLE, z);
-	dev->SetRenderState(D3DRS_CULLMODE, c);
-	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, bl);
-	RwRasterPopContext();
-	RwCameraBeginUpdate(Scene.camera);
-	if(sfxLog && sfxLogU2 < 8){
-		sfxLogU2++;
-		fprintf(sfxLog, "U2 gpu fill %dx%d\n", cw, ch);
+	if(sfxSysCopy->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK)
+		return;
+	dst = (RwUInt8*)RwRasterLock(sfxLiveRaster, 0, 1);
+	if(dst == nil){
+		sfxSysCopy->UnlockRect();
+		return;
 	}
-	return 1;
+	cw = sfxSysW;
+	ch = sfxSysH;
+	for(y = 0; y < ch; y++)
+		memcpy(dst + y*cw*4, (RwUInt8*)lr.pBits + y*lr.Pitch, cw*4);
+	RwRasterUnlock(sfxLiveRaster);
+	sfxSysCopy->UnlockRect();
+	sfxLiveFilledAt = sfxProbeFrame;
 }
 
-// v9.35: SEH wrapper + one-shot failure logging. Called at the
-// resolve (BEFORE the colour filter reads the front buffer - that is
-// what keeps the chain same-frame) and from UpdateFrontBuffer.
+// write the cached live image into the front buffer - vanilla write
+static void
+sfxLiveBlitFB(void)
+{
+	RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
+	RwRasterRenderFast(sfxLiveRaster, 0, 0);
+	RwRasterPopContext();
+	if(sfxLog && sfxLogU2 < 8){
+		sfxLogU2++;
+		fprintf(sfxLog, "U2 live fb %dx%d\n", sfxLiveW, sfxLiveH);
+	}
+}
+
+// v9.36: SEH wrapper. Uploads the live back buffer ONCE per frame
+// (cached) and blits it into the front buffer with the vanilla write
+// path - safe for the pause menu (no raw D3D state touched).
 static int
 sfxHDRfillLive(void)
 {
-	int ok;
-	if(CPostEffects::pRasterFrontBuffer == nil)
+	int ok = 1;
+	if(CPostEffects::pRasterFrontBuffer == nil || sfxLiveRaster == nil)
 		return 0;
 	__try{
-		ok = sfxGPUfillFB();
+		if(sfxLiveFilledAt != sfxProbeFrame)
+			sfxLiveUpload();
+		if(sfxLiveRaster != nil)
+			sfxLiveBlitFB();
+		else
+			ok = 0;
 	}
 	__except(EXCEPTION_EXECUTE_HANDLER){
 		ok = 0;
 		sfxHDRready = 0;
 		if(sfxLog)
-			fprintf(sfxLog, "U2 gpu fill faulted - stock path from now on\n");
+			fprintf(sfxLog, "U2 live fill faulted - stock path from now on\n");
 	}
 	if(!ok && sfxLog && sfxLogU2 < 16){
 		sfxLogU2++;
-		fprintf(sfxLog, "U2 gpu fill FAILED - stock copy this call\n");
+		fprintf(sfxLog, "U2 live fill FAILED - stock copy this call\n");
 	}
 	return ok;
 }
@@ -1877,7 +1876,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.35) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2666,12 +2665,16 @@ sfxProbeBackBuffer(void)
 	sys->UnlockRect();
 	sys->Release();
 	bb->Release();
-	// classify
+	// classify. v9.36: the SAT band - the yellow full-screen state has
+	// a bright average but dark HUD specks drag mn down, which blinded
+	// the old BEIGE test (that is why the yellow episodes never
+	// printed). c&0xFF is the blue channel of the ARGB dword.
 	if(mx < 6)				v = 2;
 	else if(mn > 230)		v = 1;
-	else if(mn > 90 && (sum/64) > 120)	v = 3;	// the beige-out band
+	else if(mn > 90 && (sum/64) > 120)	v = 3;	// beige-out band
+	else if((sum/64) > 110 && mn <= 90)	v = 4;	// saturated + HUD
 	else					v = 0;
-	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : "";
+	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : v == 4 ? " SAT" : "";
 	fs = "";
 	// v9.34: at any non-normal verdict, identify the filter chain's
 	// input raster - pointer, size, and whether the engage gate holds.
