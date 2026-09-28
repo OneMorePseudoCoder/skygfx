@@ -209,7 +209,7 @@ sfxBBtoFB(int w, int h)
 	D3DLOCKED_RECT lr;
 	RwUInt8 *dst;
 	int y;
-	if(dev == nil || pRasterFrontBuffer == nil || w <= 0 || h <= 0)
+	if(dev == nil || CPostEffects::pRasterFrontBuffer == nil || w <= 0 || h <= 0)
 		return 0;
 	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 		|| bb == nil)
@@ -257,7 +257,7 @@ sfxBBtoFB(int w, int h)
 		memcpy(dst + y*w*4, (RwUInt8*)lr.pBits + y*lr.Pitch, w*4);
 	RwRasterUnlock(sfxLiveRaster);
 	sfxSysCopy->UnlockRect();
-	RwRasterPushContext(pRasterFrontBuffer);
+	RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
 	RwRasterRenderFast(sfxLiveRaster, 0, 0);
 	RwRasterPopContext();
 	if(sfxLog && sfxLogU2 < 8){
@@ -1810,7 +1810,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.32) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.32a) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
