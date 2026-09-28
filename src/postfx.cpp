@@ -1198,6 +1198,12 @@ CPostEffects::Grain_PS2(int strength, bool generate)
 	CPostEffects::ImmediateModeRenderStatesReStore();
 }
 
+// v9.30j2 build fix: the blank-front-buffer guard inside ColourFilter_switch
+// runs BEFORE the log section below declares these - C2065/C3861. Declare
+// them here instead (re-declaring a static function prototype is legal).
+static int sfxLogCF;
+static void sfxLogLine(const char *fmt, ...);
+
 void
 CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 {
@@ -1672,7 +1678,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30j) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30j2) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1722,7 +1728,8 @@ static int sfxLogXF;
 static int sfxLogDFE;
 static int sfxLogVP;
 static int sfxLogCL;
-static int sfxLogCF;
+// (sfxLogCF moved to the top of ColourFilter_switch's section in v9.30j2 -
+// its first use is above this point and MSVC rejects use-before-declaration)
 static void sfxHDRclearFull(void);
 static void sfxSkyDraw(const struct SfxD3DViewport *svp);
 
