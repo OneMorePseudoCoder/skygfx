@@ -212,6 +212,7 @@ static int sfxSysW, sfxSysH;
 static RwRaster *sfxLiveRaster;
 static int sfxLiveW, sfxLiveH;
 static int sfxLiveFilledAt = -1;
+static int sfxLogUF;				// bounded log: upload failures
 
 static void
 sfxLiveUpload(void)
@@ -292,19 +293,29 @@ sfxLiveBlitFB(void)
 // v9.36: SEH wrapper. Uploads the live back buffer ONCE per frame
 // (cached) and blits it into the front buffer with the vanilla write
 // path - safe for the pause menu (no raw D3D state touched).
+// v9.36b: the raster is CREATED inside sfxLiveUpload, so requiring it
+// before the first upload was a chicken-and-egg that disabled the
+// whole path (the 9.36a run: zero "U2 live fb" lines - stock fill all
+// session). Only pRasterFrontBuffer gates the entry now; a failed
+// upload falls back to the stock copy for that call.
 static int
 sfxHDRfillLive(void)
 {
 	int ok = 1;
-	if(CPostEffects::pRasterFrontBuffer == nil || sfxLiveRaster == nil)
+	if(CPostEffects::pRasterFrontBuffer == nil)
 		return 0;
 	__try{
-		if(sfxLiveFilledAt != sfxProbeFrame)
+		if(sfxLiveRaster == nil || sfxLiveFilledAt != sfxProbeFrame)
 			sfxLiveUpload();
 		if(sfxLiveRaster != nil)
 			sfxLiveBlitFB();
-		else
+		else{
 			ok = 0;
+			if(sfxLog && sfxLogUF < 8){
+				sfxLogUF++;
+				fprintf(sfxLog, "U2 upload failed - stock copy this call\n");
+			}
+		}
 	}
 	__except(EXCEPTION_EXECUTE_HANDLER){
 		ok = 0;
@@ -337,8 +348,9 @@ CPostEffects::UpdateFrontBuffer(void)
 	// filled AFTER the filter had already read last frame's content -
 	// a same-frame feedback loop that accumulated into the blurred
 	// warm wash (screenshot 76), the white-out peaks and the warm
-	// snap. The fill is GPU-only now (StretchRect + quad), so running
-	// it for every refresh costs a fraction of the old CPU readback.
+	// snap. v9.36: the write is the vanilla RW path again (the raw
+	// D3D quad corrupted the pause menu); the CPU readback is cached
+	// once per frame like 9.34a, so every-refresh stays affordable.
 	if(sfxHDRready && sfxBBRaster != nil
 		&& RwCameraGetRaster(Scene.camera) == sfxBBRaster){
 		if(sfxHDRfillLive())
@@ -1875,7 +1887,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36a) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
