@@ -2346,9 +2346,19 @@ sfxSkyDraw(const struct SfxD3DViewport *svp)
 {
 	sfxHDRclearFull();
 	d3dSetViewportOrig(d3d9device, (void *)svp);	// v9.30g2: void* param - const T* -> void* is C2664
-	((void (*)(void))0x713950)();	// CClouds::Render - vanilla order, retargeted
+	// v9.30h: the sky GRADIENT is NOT part of CClouds::Render. Vanilla
+	// draws it in DoRWStuffStartOfFrame_Horizon (0x53D7A0):
+	//   DefinedState -> camera view update -> CClouds::RenderSkyPolys
+	// i.e. BEFORE our fp16 bind - it landed on the back buffer and the
+	// fp16 resolve wiped it every frame (hence the black sky, while
+	// sun/moon/clouds - real CClouds::Render content - survived).
+	// Replay the same vanilla sequence here, straight into the fp16
+	// sub-rect. Pointer calls only - zero game bytes patched.
+	((void (*)(void))0x734650)();	// DefinedState - vanilla render states
+	((void (*)(void))0x714650)();	// CClouds::RenderSkyPolys - the gradient
+	((void (*)(void))0x713950)();	// CClouds::Render - sun/moon/clouds
 	if(sfxLogCap++ < 2000)
-		sfxLogLine("SKY drawn into fp16 sub-rect (vanilla fn, no patches)\n");
+		sfxLogLine("SKY drawn into fp16 sub-rect (gradient+clouds, vanilla fns, no patches)\n");
 }
 
 void
