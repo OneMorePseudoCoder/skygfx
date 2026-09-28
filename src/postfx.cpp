@@ -1221,62 +1221,6 @@ CPostEffects::Grain_PS2(int strength, bool generate)
 static int sfxLogCF;
 static void sfxLogLine(const char *fmt, ...);
 
-// v9.30l: content signature of a raster - lock level 0 and hash the first
-// pixels plus min/max. The PS2 filter chain input turning uniform white
-// (mn==mx, high) is the white-frame marker this build hunts for. Normal
-// frames stay silent; uniform/white/black frames and short calibration
-// windows print, throttled per burst.
-// (sfxFrameNo moved up here in v9.30l - the signature helper below uses it)
-static unsigned int sfxFrameNo;
-static int sfxSigBudget;
-static int sfxSigBurstCF;
-static int sfxSigBurstRS;
-static int sfxSigBurstDFE;
-static void
-sfxFBSig(RwRaster *r, const char *tag, int *burst)
-{
-	RwUInt8 *p;
-	unsigned int s = 0;
-	int i, mn = 255, mx = 0;
-	int uniform, white, black;
-	if(r == nil || sfxSigBudget >= 2500)
-		return;
-	p = RwRasterLock(r, 0, 1);
-	if(p == nil){
-		if(sfxSigBudget < 2500){
-			sfxLogLine("SIG %s f=%u lockfail\n", tag, sfxFrameNo);
-			sfxSigBudget += 16;
-		}
-		return;
-	}
-	for(i = 0; i < 64; i++){
-		int v = p[i*4];
-		s = s*31 + (unsigned int)v;
-		if(v > mx) mx = v;
-		if(v < mn) mn = v;
-	}
-	uniform = (mx - mn) < 12;
-	white = uniform && mn > 239;
-	black = uniform && mn < 6;
-	if(white || black){
-		(*burst)++;
-		if(*burst != 1 && (*burst % 8) != 0){
-			RwRasterUnlock(r);
-			return;
-		}
-	}else
-		*burst = 0;
-	if(!white && !black && (int)sfxFrameNo >= 10 && (sfxFrameNo & 255) != 0){
-		RwRasterUnlock(r);
-		return;
-	}
-	sfxSigBudget++;
-	sfxLogLine("SIG %s f=%u %08x mn=%d mx=%d r0=%02x%02x%02x%02x mid=%02x%02x%02x%02x\n",
-		tag, sfxFrameNo, s, mn, mx,
-		p[0], p[1], p[2], p[3], p[25600], p[25601], p[25602], p[25603]);
-	RwRasterUnlock(r);
-}
-
 void
 CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 {
@@ -1317,7 +1261,6 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 		static RwRaster *lastFB;
 		static int lastW, lastH;
 		RwRaster *fb = pRasterFrontBuffer;
-		sfxFBSig(fb, "CF", &sfxSigBurstCF);
 		int w = fb ? RwRasterGetWidth(fb) : 0;
 		int h = fb ? RwRasterGetHeight(fb) : 0;
 		if(fb != lastFB || w != lastW || h != lastH){
@@ -1752,7 +1695,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30l2) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30m) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1796,7 +1739,8 @@ static int sfxHDRresolve(RwRaster *camR);
 // resolve stretches it back - vanilla "nothing is ever cleared"
 // semantics, no game bytes touched.
 static int sfxLogCap;	// v9.30g: sky-call log cap (sfxLogS is taken, C2086)
-// v9.30i blink/shadow diagnostics: (sfxFrameNo lives with the v9.30l sig helper)
+// v9.30i blink/shadow diagnostics: frame counter + per-stream line budgets
+static unsigned int sfxFrameNo;
 static int sfxLogXF;
 static int sfxLogDFE;
 static int sfxLogVP;
@@ -2454,6 +2398,150 @@ sfxHDRclearFull(void)
 	d3d9device->Clear(0, nil, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
 }
 
+// ---- v9.30m: safe content probes -----------------------------------
+// v9.30l/l2 tried to read GPU rasters with RwRasterLock. Locking a
+// D3D9 render-target raster is illegal: the unlock re-uploaded a
+// stale/empty system-memory copy over the live buffer and painted the
+// whole frame black (user screenshots 71/72). These probes use only
+// the legal readback path: GetRenderTargetData into a SYSTEMMEM
+// offscreen surface - a plain GPU->CPU copy that cannot modify the
+// source - and then lock THAT surface. All calls checked; on the
+// first failure the probe reports once and switches itself off.
+// Sampling: the first 10 frames, then every 20th frame, plus every
+// frame while a burst is running (a burst starts when the verdict
+// changes, so white->normal->warm transitions are caught quickly).
+static int sfxProbeBBLast = -1;  // verdict: -1 unknown, 0 normal, 1 white, 2 black
+static int sfxProbeBBBurst;
+static int sfxProbeBBFail;
+static int sfxProbeHLast = -1;
+static int sfxProbeHBurst;
+static int sfxProbeHFail;
+static int sfxProbeBudget = 500;
+
+static void
+sfxProbeVerdict(const char *tag, unsigned int h, int mn, int mx,
+                unsigned int p0, unsigned int pm,
+                int wthr, int bthr, int spthr, int *last, int *burst)
+{
+	int v = 0, print;
+	if(mx - mn < spthr){
+		if(mn > wthr) v = 1;
+		else if(mx < bthr) v = 2;
+	}
+	print = 0;
+	if(v != *last){
+		print = 1;
+		*burst = 24;
+	}else if(v != 0){
+		if((sfxFrameNo & 7) == 0)
+			print = 1;
+	}else if(sfxFrameNo < 10 || (sfxFrameNo % 240) == 0)
+		print = 1;
+	if(*burst > 0)
+		(*burst)--;
+	*last = v;
+	if(!print || sfxProbeBudget <= 0)
+		return;
+	sfxProbeBudget--;
+	sfxLogLine("PROBE %s f=%u h=%08x mn=%d mx=%d p0=%08x pm=%08x%s\n",
+		tag, sfxFrameNo, h, mn, mx, p0, pm,
+		v == 1 ? " WHITE" : v == 2 ? " BLACK" : "");
+}
+
+// Truth probe: what the player actually sees - the back buffer right
+// after the final composite quad, before HUD/fade draw on top.
+static void
+sfxProbeBackBuffer(void)
+{
+	IDirect3DDevice9 *dev = d3d9device;
+	IDirect3DSurface9 *bb = nil, *sys = nil;
+	D3DSURFACE_DESC d;
+	D3DLOCKED_RECT lr;
+	unsigned int s = 0, p0 = 0, pm = 0;
+	unsigned int f = sfxFrameNo;
+	int i, mn = 255, mx = 0;
+	if(dev == nil)
+		return;
+	if(sfxProbeBBBurst == 0 && f >= 10 && (f % 20) != 0)
+		return;
+	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || bb == nil)
+		return;
+	if(bb->GetDesc(&d) != D3D_OK ||
+	   dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+	                                    D3DPOOL_SYSTEMMEM, &sys, nil) != D3D_OK ||
+	   dev->GetRenderTargetData(bb, sys) != D3D_OK ||
+	   sys->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK){
+		if(!sfxProbeBBFail){
+			sfxProbeBBFail = 1;
+			sfxLogLine("PROBE BB readback unavailable - probe off\n");
+		}
+		if(sys) sys->Release();
+		bb->Release();
+		return;
+	}
+	for(i = 0; i < 64; i++){
+		unsigned int v = *(unsigned int*)((unsigned char*)lr.pBits
+			+ (d.Height/16 + (i>>3)*(d.Height/8))*lr.Pitch
+			+ (d.Width/16 + (i&7)*(d.Width/8))*4);
+		int r = (int)(v & 0xFF);
+		s = s*31 + v;
+		if(r > mx) mx = r;
+		if(r < mn) mn = r;
+		if(i == 0) p0 = v;
+		if(i == 36) pm = v;
+	}
+	sys->UnlockRect();
+	sys->Release();
+	bb->Release();
+	sfxProbeVerdict("BB", s, mn, mx, p0, pm, 230, 6, 12,
+	                &sfxProbeBBLast, &sfxProbeBBBurst);
+}
+
+// FP16 scene content at resolve time (A16B16G16R16F, 8 bytes/px;
+// the low 16 bits of the first dword are the red channel as half).
+static void
+sfxProbeFP16(void)
+{
+	IDirect3DDevice9 *dev = d3d9device;
+	IDirect3DSurface9 *src = (IDirect3DSurface9*)sfxHDRsurf, *sys = nil;
+	D3DSURFACE_DESC d;
+	D3DLOCKED_RECT lr;
+	unsigned int s = 0, p0 = 0, pm = 0;
+	unsigned int f = sfxFrameNo;
+	int i, mn = 32767, mx = -32768;
+	if(dev == nil || src == nil)
+		return;
+	if(sfxProbeHBurst == 0 && f >= 10 && (f % 20) != 0)
+		return;
+	if(src->GetDesc(&d) != D3D_OK ||
+	   dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+	                                    D3DPOOL_SYSTEMMEM, &sys, nil) != D3D_OK ||
+	   dev->GetRenderTargetData(src, sys) != D3D_OK ||
+	   sys->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK){
+		if(!sfxProbeHFail){
+			sfxProbeHFail = 1;
+			sfxLogLine("PROBE H16 readback unavailable - probe off\n");
+		}
+		if(sys) sys->Release();
+		return;
+	}
+	for(i = 0; i < 32; i++){
+		unsigned int v = *(unsigned int*)((unsigned char*)lr.pBits
+			+ (d.Height/16 + (i>>2)*(d.Height/8))*lr.Pitch
+			+ (d.Width/16 + (i&3)*(d.Width/8))*8);
+		int r = (int)(unsigned short)(v & 0xFFFF);
+		s = s*31 + v;
+		if(r > mx) mx = r;
+		if(r < mn) mn = r;
+		if(i == 0) p0 = v;
+		if(i == 17) pm = v;
+	}
+	sys->UnlockRect();
+	sys->Release();
+	sfxProbeVerdict("H16", s, mn, mx, p0, pm, 14000, 100, 800,
+	                &sfxProbeHLast, &sfxProbeHBurst);
+}
+
 // v9.30g: the sky, drawn the vanilla way, into the FP16 sub-rect.
 // CClouds::Render (0x713950) projects its vertices through the CURRENT
 // viewport, so with the scaled viewport set the gradient, clouds,
@@ -2769,32 +2857,11 @@ sfxHDRresolve(RwRaster *camR)
 	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 		|| bb == nil)
 		return 0;
-	// v9.30l: what does the FP16 buffer actually contain? Sampled raw
-	// (A16B16G16R16F = 8 bytes/px); calibration + uniform frames only.
-	{ static int fpsig = 0;
-	  if(fpsig < 50 && ((int)sfxFrameNo < 6 || (sfxFrameNo & 63) == 0)
-		  && sfxHDRsurf != nil){
-		  D3DLOCKED_RECT lr;
-		  if(((IDirect3DSurface9*)sfxHDRsurf)->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
-			  unsigned char *q = (unsigned char*)lr.pBits;
-			  unsigned int s = 0;
-			  int i, mn = 32767, mx = -32768;
-			  for(i = 0; i < 32; i++){
-				  int v = (int)(unsigned short)(q[i*8] | (q[i*8+1] << 8));
-				  s = s*31 + (unsigned int)v;
-				  if(v > mx) mx = v;
-				  if(v < mn) mn = v;
-			  }
-			  fpsig++;
-			  sfxLogLine("SIG FP16 f=%u %08x %d..%d %02x%02x %02x%02x\n",
-				  sfxFrameNo, s, mn, mx, q[0], q[1], q[6400], q[6401]);
-			  ((IDirect3DSurface9*)sfxHDRsurf)->UnlockRect();
-		  }else{
-			  fpsig = 50;
-			  sfxLogLine("SIG FP16 lockfail\n");
-		  }
-	  }
-	}
+	// v9.30m: safe FP16 content probe. v9.30l LockRect-ed this render
+	// target surface directly, which is illegal on D3D9 and corrupted
+	// the frame (user screenshots 71/72 - all black). GetRenderTargetData
+	// copies GPU->CPU without touching the source.
+	sfxProbeFP16();
 	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
 	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
 	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
@@ -2902,7 +2969,6 @@ RenderScale_DeferredStretch(void)
 		  if(ufr++ < 20)
 			  sfxLogLine("R2 fbrefresh after resolve\n");
 		}
-		sfxFBSig(CPostEffects::pRasterFrontBuffer, "RS", &sfxSigBurstRS);
 	}else if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
@@ -3025,7 +3091,6 @@ CPostEffects::DrawFinalEffects(void)
 
 	// scene, after all game post effects, into the front buffer
 	UpdateFrontBuffer();
-	sfxFBSig(pRasterFrontBuffer, "DFE", &sfxSigBurstDFE);
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
@@ -3181,6 +3246,8 @@ CPostEffects::DrawFinalEffects(void)
 	overrideIm2dPixelShader = finalPS;
 	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
 	overrideIm2dPixelShader = nil;
+	// v9.30m: content of the FINAL composite output - the truth probe.
+	sfxProbeBackBuffer();
 
 	RwD3D9SetTexture(nil, 1);
 	RwD3D9SetTexture(nil, 2);
