@@ -181,10 +181,6 @@ static int sfxProbeFrame;			// heartbeat, ++ per DFE call
 // any of this.
 static int sfxHDRready;				// set once the fp16 buffer exists
 static RwRaster *sfxBBRaster;		// the swap-chain-backed camera raster
-static IDirect3DSurface9 *sfxSysCopy;
-static int sfxSysW, sfxSysH;
-static RwRaster *sfxLiveRaster;
-static int sfxLiveW, sfxLiveH;
 static int sfxLogU2;
 static int sfxLogBR;
 
@@ -202,18 +198,26 @@ sfxBBRegister(RwRaster *camR)
 	sfxBBRaster = camR;
 }
 
-// back buffer -> front buffer, all-live edition. Returns 1 on success;
-// on failure the caller falls through to the stock copy.
+// back buffer -> front buffer, all-GPU edition (v9.35). StretchRect
+// the back buffer into our own render-target texture, then draw it
+// 1:1 into the front-buffer raster through RW's own push context -
+// the same structure as the vanilla copy, just with a live source
+// and no CPU round-trip. The vanilla RwRasterRenderFast from the
+// camera raster is poisoned on this machine: RW serves its own stale
+// system copy of that back-buffer-backed raster (the frozen warm
+// image that fed the whole colour chain).
+static IDirect3DTexture9 *sfxCopyTex;
+static int sfxCopyW, sfxCopyH;
 static int
-sfxBBtoFB(int w, int h)
+sfxGPUfillFB(void)
 {
 	IDirect3DDevice9 *dev = d3d9device;
-	IDirect3DSurface9 *bb = nil;
+	IDirect3DSurface9 *bb = nil, *dst = nil;
 	D3DSURFACE_DESC d;
-	D3DLOCKED_RECT lr;
-	RwUInt8 *dst;
-	int y, cw, ch;
-	if(dev == nil || CPostEffects::pRasterFrontBuffer == nil || w <= 0 || h <= 0)
+	DWORD z = 0, c = 0, bl = 0;
+	struct { float x, y, z, rhw, u, v; } v[4];
+	int cw, ch, i;
+	if(dev == nil || CPostEffects::pRasterFrontBuffer == nil)
 		return 0;
 	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 		|| bb == nil)
@@ -222,62 +226,99 @@ sfxBBtoFB(int w, int h)
 		bb->Release();
 		return 0;
 	}
-	if(sfxSysCopy == nil || sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
-		if(sfxSysCopy)
-			sfxSysCopy->Release();
-		sfxSysCopy = nil;
-		if(dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
-			D3DPOOL_SYSTEMMEM, &sfxSysCopy, nil) != D3D_OK){
-			sfxSysCopy = nil;
+	if(sfxCopyTex == nil || sfxCopyW != (int)d.Width || sfxCopyH != (int)d.Height){
+		if(sfxCopyTex){
+			sfxCopyTex->Release();
+			sfxCopyTex = nil;
+		}
+		if(dev->CreateTexture(d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET,
+			d.Format, D3DPOOL_DEFAULT, &sfxCopyTex, nil) != D3D_OK){
 			bb->Release();
 			return 0;
 		}
-		sfxSysW = d.Width;
-		sfxSysH = d.Height;
+		sfxCopyW = (int)d.Width;
+		sfxCopyH = (int)d.Height;
 	}
-	if(dev->GetRenderTargetData(bb, sfxSysCopy) != D3D_OK){
+	if(sfxCopyTex->GetSurfaceLevel(0, &dst) != D3D_OK || dst == nil){
 		bb->Release();
 		return 0;
 	}
+	if(dev->StretchRect(bb, nil, dst, nil, D3DTEXF_NONE) != D3D_OK){
+		dst->Release();
+		bb->Release();
+		return 0;
+	}
+	dst->Release();
 	bb->Release();
-	// v9.33: the front-buffer raster and the swap chain can DIFFER in
-	// size (the 932 run showed a 2048x1024 front raster on a 1600x900
-	// swap chain). Copy only the intersection - reading the source
-	// beyond the back-buffer-sized system copy was the v9.32a crash
-	// (fault registers: row stride 0x2000 = 2048px, 0x400 = 1024 rows).
-	cw = (int)d.Width < w ? (int)d.Width : w;
-	ch = (int)d.Height < h ? (int)d.Height : h;
+	// copy only the intersection of the swap chain and the front
+	// raster (the front raster can be 2048x1024 on a 1600x900 swap
+	// chain on this machine - the v9.33 lesson)
+	cw = sfxCopyW < CPostEffects::pRasterFrontBuffer->width
+		? sfxCopyW : CPostEffects::pRasterFrontBuffer->width;
+	ch = sfxCopyH < CPostEffects::pRasterFrontBuffer->height
+		? sfxCopyH : CPostEffects::pRasterFrontBuffer->height;
 	if(cw <= 0 || ch <= 0)
 		return 0;
-	if(sfxLiveRaster == nil || sfxLiveW != cw || sfxLiveH != ch){
-		if(sfxLiveRaster)
-			RwRasterDestroy(sfxLiveRaster);
-		sfxLiveRaster = nil;
-		sfxLiveRaster = RwRasterCreate(cw, ch, 32, rwRASTERTYPECAMERATEXTURE);
-		if(sfxLiveRaster == nil)
-			return 0;
-		sfxLiveW = cw;
-		sfxLiveH = ch;
-	}
-	if(sfxSysCopy->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK)
-		return 0;
-	dst = (RwUInt8*)RwRasterLock(sfxLiveRaster, 0, 1);
-	if(dst == nil){
-		sfxSysCopy->UnlockRect();
-		return 0;
-	}
-	for(y = 0; y < ch; y++)
-		memcpy(dst + y*cw*4, (RwUInt8*)lr.pBits + y*lr.Pitch, cw*4);
-	RwRasterUnlock(sfxLiveRaster);
-	sfxSysCopy->UnlockRect();
+	RwCameraEndUpdate(Scene.camera);
 	RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
-	RwRasterRenderFast(sfxLiveRaster, 0, 0);
+	dev->GetRenderState(D3DRS_ZENABLE, &z);
+	dev->GetRenderState(D3DRS_CULLMODE, &c);
+	dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &bl);
+	dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+	dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+	dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+	v[0].x = -0.5f;    v[0].y = -0.5f;    v[0].u = 0.0f; v[0].v = 0.0f;
+	v[1].x = cw - 0.5f; v[1].y = -0.5f;    v[1].u = 1.0f; v[1].v = 0.0f;
+	v[2].x = -0.5f;    v[2].y = ch - 0.5f; v[2].u = 0.0f; v[2].v = 1.0f;
+	v[3].x = cw - 0.5f; v[3].y = ch - 0.5f; v[3].u = 1.0f; v[3].v = 1.0f;
+	for(i = 0; i < 4; i++){
+		v[i].z = 0.0f;
+		v[i].rhw = 1.0f;
+	}
+	dev->SetTexture(0, sfxCopyTex);
+	dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(v));
+	dev->SetTexture(0, nil);
+	dev->SetRenderState(D3DRS_ZENABLE, z);
+	dev->SetRenderState(D3DRS_CULLMODE, c);
+	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, bl);
 	RwRasterPopContext();
+	RwCameraBeginUpdate(Scene.camera);
 	if(sfxLog && sfxLogU2 < 8){
 		sfxLogU2++;
-		fprintf(sfxLog, "U2 live fb %dx%d\n", w, h);
+		fprintf(sfxLog, "U2 gpu fill %dx%d\n", cw, ch);
 	}
 	return 1;
+}
+
+// v9.35: SEH wrapper + one-shot failure logging. Called at the
+// resolve (BEFORE the colour filter reads the front buffer - that is
+// what keeps the chain same-frame) and from UpdateFrontBuffer.
+static int
+sfxHDRfillLive(void)
+{
+	int ok;
+	if(CPostEffects::pRasterFrontBuffer == nil)
+		return 0;
+	__try{
+		ok = sfxGPUfillFB();
+	}
+	__except(EXCEPTION_EXECUTE_HANDLER){
+		ok = 0;
+		sfxHDRready = 0;
+		if(sfxLog)
+			fprintf(sfxLog, "U2 gpu fill faulted - stock path from now on\n");
+	}
+	if(!ok && sfxLog && sfxLogU2 < 16){
+		sfxLogU2++;
+		fprintf(sfxLog, "U2 gpu fill FAILED - stock copy this call\n");
+	}
+	return ok;
 }
 
 void
@@ -291,32 +332,19 @@ CPostEffects::UpdateFrontBuffer(void)
 	// v9.33: belt and suspenders - any fault in the copy path falls
 	// back to the stock copy and disables the live path for good, so
 	// the worst case is the old behaviour, never a crash.
+	// v9.35: fill at EVERY camera-on-back-buffer refresh (the vanilla
+	// semantics: after the colour filter the refresh must capture the
+	// FILTERED image for radiosity, after the post-effect refresh the
+	// FINAL image for the composite). The old once-per-frame cache
+	// filled AFTER the filter had already read last frame's content -
+	// a same-frame feedback loop that accumulated into the blurred
+	// warm wash (screenshot 76), the white-out peaks and the warm
+	// snap. The fill is GPU-only now (StretchRect + quad), so running
+	// it for every refresh costs a fraction of the old CPU readback.
 	if(sfxHDRready && sfxBBRaster != nil
 		&& RwCameraGetRaster(Scene.camera) == sfxBBRaster){
-		// v9.34: the full readback runs ONCE per frame (the first
-		// UpdateFrontBuffer with the camera on the swap chain); later
-		// calls in the same frame skip - the fill persists for the
-		// frame. 2-3 full readbacks per frame were the v9.33 FPS drop.
-		static int filledAt = -1;
-		int ok = 0;
-		if(filledAt == sfxProbeFrame)
+		if(sfxHDRfillLive())
 			return;
-		__try{
-			ok = sfxBBtoFB(CPostEffects::pRasterFrontBuffer->width, CPostEffects::pRasterFrontBuffer->height);
-		}
-		__except(EXCEPTION_EXECUTE_HANDLER){
-			ok = 0;
-			sfxHDRready = 0;
-			if(sfxLog)
-				fprintf(sfxLog, "U2 live copy faulted - stock path from now on\n");
-		}
-		filledAt = sfxProbeFrame;
-		if(ok)
-			return;
-		if(sfxLog && sfxLogU2 < 16){
-			sfxLogU2++;
-			fprintf(sfxLog, "U2 live fill FAILED - stock copy this frame\n");
-		}
 	}
 	// v9.30k: WHICH raster is the camera holding when the filter chain
 	// refreshes its front buffer? The colour filter / radiosity chain
@@ -1849,7 +1877,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.34a) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.35) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3256,12 +3284,14 @@ RenderScale_DeferredStretch(void)
 	if(sfxHDRon && sfxHDRresolve(camR)){
 		// resolved straight from the FP16 buffer; the RsGlobal and
 		// NoClear cleanup at the end of this function is shared
-		// v9.32: remember that this raster is the swap-chain-backed
-		// one - UpdateFrontBuffer now fills the front buffer live from
-		// the back buffer whenever the camera sits on it (the 931 run
-		// proved cam==bb:1, so the old copy here was a self-blit that
-		// never touched RW's stale system copy of the raster).
+		// v9.32/35: remember the swap-chain-backed raster, and fill the
+		// front buffer from the live back buffer NOW - before the
+		// colour filter chain reads it. This is the fill that breaks
+		// the feedback loop: the filter must see THIS frame's resolve,
+		// not last frame's (the 934a run proved the loop: FB one frame
+		// behind = blurred warm wash + white-out peaks + warm snap).
 		sfxBBRegister(camR);
+		sfxHDRfillLive();
 	}else if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
