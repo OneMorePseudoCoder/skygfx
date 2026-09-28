@@ -1695,7 +1695,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30o) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.31) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3047,6 +3047,114 @@ sfxHDRresolve(RwRaster *camR)
 // CCoronas::Render stub inside RenderEffects - after CMovingThings::Render
 // (Project2DFX LOD lights) and before the fx/HUD draws that need the full
 // raster - and also from DrawFinalEffects as a safety net.
+// ---- v9.31: back buffer -> camera raster copy -----------------------
+// The resolve paints the FP16 scene into the swap-chain back buffer,
+// but the vanilla tail (radiosity feedback, colour filter, composite)
+// reads the CAMERA raster - and under hdrBuffer=1 the scene never
+// passes through that raster. The v9.30k refresh then copied that
+// stale raster into the front buffer EVERY frame, painting days-old
+// warm content over the live resolve: the frozen beige frame and the
+// warm ON-OFF snap (v9.30o proof: RB live sky, BB byte-frozen warm in
+// the same frame). Copy in the correct direction instead - back
+// buffer into the camera raster - so the whole vanilla tail runs on
+// current pixels. Device-level only: StretchRect into our own render
+// target, then one textured quad into the camera raster through RW's
+// own target binding. No game bytes patched; on any failure the copy
+// logs once and the frame continues stock.
+static IDirect3DTexture9 *sfxCopyTex;
+static int sfxCopyW, sfxCopyH;
+static int sfxLogH3;
+static void
+sfxBBtoCam(RwRaster *camR)
+{
+	IDirect3DDevice9 *dev = d3d9device;
+	IDirect3DSurface9 *bb = nil, *dst = nil, *cur = nil, *sbb = nil;
+	D3DSURFACE_DESC d;
+	DWORD z = 0, c = 0, bl = 0;
+	struct { float x, y, z, rhw, u, v; } v[4];
+	float w, h;
+	int i;
+	if(dev == nil || camR == nil)
+		return;
+	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
+		|| bb == nil)
+		return;
+	if((sfxCopyTex == nil || sfxCopyW != camR->width || sfxCopyH != camR->height)
+		&& bb->GetDesc(&d) == D3D_OK){
+		if(sfxCopyTex){
+			sfxCopyTex->Release();
+			sfxCopyTex = nil;
+		}
+		if(dev->CreateTexture(camR->width, camR->height, 1,
+			D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT,
+			&sfxCopyTex, nil) == D3D_OK){
+			sfxCopyW = camR->width;
+			sfxCopyH = camR->height;
+		}
+	}
+	if(sfxCopyTex == nil
+		|| ((IDirect3DTexture9*)sfxCopyTex)->GetSurfaceLevel(0, &dst) != D3D_OK
+		|| dst == nil){
+		if(sfxLogH3++ < 8)
+			sfxLogLine("H3 copy tex unavailable\n");
+		bb->Release();
+		return;
+	}
+	if(dev->StretchRect(bb, nil, dst, nil, D3DTEXF_NONE) != D3D_OK){
+		if(sfxLogH3++ < 8)
+			sfxLogLine("H3 StretchRect failed\n");
+		dst->Release();
+		bb->Release();
+		return;
+	}
+	dst->Release();
+	bb->Release();
+	// rebind the camera raster cleanly (the resolve left its update
+	// context open - end it, the copy quad runs in a fresh one)
+	RwCameraEndUpdate(Scene.camera);
+	RwCameraBeginUpdate(Scene.camera);
+	dev->GetRenderState(D3DRS_ZENABLE, &z);
+	dev->GetRenderState(D3DRS_CULLMODE, &c);
+	dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &bl);
+	dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+	dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+	dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+	w = (float)camR->width;
+	h = (float)camR->height;
+	v[0].x = -0.5f;    v[0].y = -0.5f;    v[0].u = 0.0f; v[0].v = 0.0f;
+	v[1].x = w - 0.5f; v[1].y = -0.5f;    v[1].u = 1.0f; v[1].v = 0.0f;
+	v[2].x = -0.5f;    v[2].y = h - 0.5f; v[2].u = 0.0f; v[2].v = 1.0f;
+	v[3].x = w - 0.5f; v[3].y = h - 0.5f; v[3].u = 1.0f; v[3].v = 1.0f;
+	for(i = 0; i < 4; i++){
+		v[i].z = 0.0f;
+		v[i].rhw = 1.0f;
+	}
+	dev->SetTexture(0, sfxCopyTex);
+	dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(v));
+	dev->SetTexture(0, nil);
+	dev->SetRenderState(D3DRS_ZENABLE, z);
+	dev->SetRenderState(D3DRS_CULLMODE, c);
+	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, bl);
+	// one-shot note: is the camera raster its own surface or the swap
+	// chain? tells us which presentation model this RW build uses.
+	if(dev->GetRenderTarget(0, &cur) == D3D_OK && cur != nil){
+		if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &sbb) == D3D_OK
+			&& sbb != nil){
+			if(sfxLogH3++ < 8)
+				sfxLogLine("H3 bb->camR copy %dx%d cam==bb:%d\n",
+					sfxCopyW, sfxCopyH, cur == sbb);
+			sbb->Release();
+		}
+		cur->Release();
+	}
+}
+
 static void
 RenderScale_DeferredStretch(void)
 {
@@ -3078,17 +3186,14 @@ RenderScale_DeferredStretch(void)
 	if(sfxHDRon && sfxHDRresolve(camR)){
 		// resolved straight from the FP16 buffer; the RsGlobal and
 		// NoClear cleanup at the end of this function is shared
-		// v9.30k: refresh the filter front buffer from the freshly
-		// resolved back buffer RIGHT NOW. The colour filter and
-		// radiosity chain sample this raster, and with hdrBuffer the
-		// previous refresh could predate the resolve - stale/wrong
-		// input showed as the flat white frame and made the warm
-		// look snap with camera movement (hdr=1 only per user A/B).
-		CPostEffects::UpdateFrontBuffer();
-		{ static int ufr = 0;
-		  if(ufr++ < 20)
-			  sfxLogLine("R2 fbrefresh after resolve\n");
-		}
+		// v9.31: the v9.30k refresh copied the camera raster -> front
+		// buffer here, but under hdrBuffer=1 the camera raster never
+		// receives the scene - it copied STALE pixels over the live
+		// resolve every frame (the frozen beige + warm snap the o-run
+		// RB/BB pair proved). Copy the back buffer INTO the camera
+		// raster instead; the chain's own refreshes then carry live
+		// pixels into the front buffer.
+		sfxBBtoCam(camR);
 	}else if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
