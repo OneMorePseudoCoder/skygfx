@@ -2345,7 +2345,7 @@ static void
 sfxSkyDraw(const struct SfxD3DViewport *svp)
 {
 	sfxHDRclearFull();
-	d3dSetViewportOrig(d3d9device, svp);
+	d3dSetViewportOrig(d3d9device, (void *)svp);	// v9.30g2: void* param - const T* -> void* is C2664
 	((void (*)(void))0x713950)();	// CClouds::Render - vanilla order, retargeted
 	if(sfxLogCap++ < 2000)
 		sfxLogLine("SKY drawn into fp16 sub-rect (vanilla fn, no patches)\n");
