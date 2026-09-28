@@ -1695,7 +1695,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30n) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30o) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2418,7 +2418,7 @@ static int sfxProbeHLast = -1;
 static int sfxProbeHBurst;
 static int sfxProbeHFail;
 static int sfxProbeGame;			// set once the resolve has run (gameplay)
-static int sfxProbeBudget = 2000;
+static int sfxProbeBudget = 3000;
 
 static void
 sfxProbeOut(const char *tag, unsigned int h, int mn, int mx, int av,
@@ -2513,6 +2513,90 @@ sfxProbeBackBuffer(void)
 	if(sfxProbeBBBurst > 0)
 		sfxProbeBBBurst--;
 	sfxProbeBBLast = v;
+}
+
+// v9.30o: the back buffer RIGHT AFTER the resolve quad. Compared with
+// the end-of-composite BB probe of the same frame this bisects the
+// freeze: RB frozen = the resolve itself stopped landing; RB live +
+// BB frozen = something between resolve and composite paints frozen
+// content over the live scene.
+static int sfxProbeRBLast = -1;
+static int sfxProbeRBBurst;
+static unsigned int sfxProbeRBHash;
+static int sfxProbeRBSame;
+static int sfxProbeRBFail;
+static void
+sfxProbeResolveBB(void)
+{
+	IDirect3DDevice9 *dev = d3d9device;
+	IDirect3DSurface9 *bb = nil, *sys = nil;
+	D3DSURFACE_DESC d;
+	D3DLOCKED_RECT lr;
+	unsigned int s = 0, p0 = 0, pm = 0;
+	int i, mn = 255, mx = 0, sum = 0, v;
+	const char *vs;
+	if(dev == nil || sfxProbeBudget <= 0)
+		return;
+	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || bb == nil)
+		return;
+	if(bb->GetDesc(&d) != D3D_OK ||
+	   dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+	                                    D3DPOOL_SYSTEMMEM, &sys, nil) != D3D_OK ||
+	   dev->GetRenderTargetData(bb, sys) != D3D_OK ||
+	   sys->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK){
+		if(!sfxProbeRBFail){
+			sfxProbeRBFail = 1;
+			sfxLogLine("PROBE RB readback unavailable - probe off\n");
+		}
+		if(sys) sys->Release();
+		bb->Release();
+		return;
+	}
+	for(i = 0; i < 64; i++){
+		unsigned int c = *(unsigned int*)((unsigned char*)lr.pBits
+			+ (d.Height/16 + (i>>3)*(d.Height/8))*lr.Pitch
+			+ (d.Width/16 + (i&7)*(d.Width/8))*4);
+		int r = (int)(c & 0xFF);
+		s = s*31 + c;
+		sum += r;
+		if(r > mx) mx = r;
+		if(r < mn) mn = r;
+		if(i == 0) p0 = c;
+		if(i == 36) pm = c;
+	}
+	sys->UnlockRect();
+	sys->Release();
+	bb->Release();
+	if(mx < 6)				v = 2;
+	else if(mn > 230)		v = 1;
+	else if(mn > 90 && (sum/64) > 120)	v = 3;
+	else					v = 0;
+	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : "";
+	if(s != 0 && s == sfxProbeRBHash){
+		sfxProbeRBSame++;
+		if((sfxProbeRBSame & 3) == 1)
+			sfxProbeOut("RB", s, mn, mx, sum/64, p0, pm, vs, " SAME");
+		vs = nil;
+	}else
+		sfxProbeRBSame = 0;
+	sfxProbeRBHash = s;
+	if(vs == nil)
+		return;
+	if(v != sfxProbeRBLast){
+		if(!sfxProbeGame && v == 2){
+			sfxProbeRBLast = v;
+			return;
+		}
+		sfxProbeRBBurst = 30;
+		sfxProbeOut("RB", s, mn, mx, sum/64, p0, pm, vs, "");
+	}else if(v != 0){
+		if(sfxProbeRBBurst > 0 && (sfxProbeFrame & 3) == 0)
+			sfxProbeOut("RB", s, mn, mx, sum/64, p0, pm, vs, "");
+	}else if(sfxProbeGame && (sfxProbeFrame % 90) == 0)
+		sfxProbeOut("RB", s, mn, mx, sum/64, p0, pm, vs, "");
+	if(sfxProbeRBBurst > 0)
+		sfxProbeRBBurst--;
+	sfxProbeRBLast = v;
 }
 
 // FP16 scene content at resolve time (A16B16G16R16F, 8 bytes/px;
@@ -2942,6 +3026,9 @@ sfxHDRresolve(RwRaster *camR)
 		v[i].rhw = 1.0f;
 	}
 	d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(struct HDRVtx));
+	// v9.30o: did the quad actually land? Content of the back buffer
+	// right now - pairs with the end-of-composite BB probe of this frame.
+	sfxProbeResolveBB();
 	// detach the FP16 texture again and restore what was switched off;
 	// RW re-issues its own state on the next camera/draw cycle
 	d3d9device->SetTexture(0, nil);
@@ -3279,6 +3366,23 @@ CPostEffects::DrawFinalEffects(void)
 	overrideIm2dPixelShader = finalPS;
 	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
 	overrideIm2dPixelShader = nil;
+	// v9.30o: which raster is the camera drawing into at composite
+	// time? A swap that sticks (overlay dims raster never restored)
+	// redirects the composite + HUD away from the presented surface.
+	{ RwRaster *cr = RwCameraGetRaster(Scene.camera);
+	  static RwRaster *lastCr; static int lastW, lastH;
+	  if(cr != lastCr || (cr != nil && (cr->width != lastW || cr->height != lastH))){
+		  if(sfxProbeBudget-- > 0)
+			  sfxLogLine("PROBE CRPTR f=%u pf=%d raster=%08x %dx%dx%d CHANGED\n",
+				  sfxFrameNo, sfxProbeFrame,
+				  (unsigned int)(void*)cr,
+				  cr != nil ? cr->width : 0, cr != nil ? cr->height : 0,
+				  cr != nil ? cr->depth : 0);
+		  lastCr = cr;
+		  lastW = cr != nil ? cr->width : 0;
+		  lastH = cr != nil ? cr->height : 0;
+	  }
+	}
 	// v9.30m: content of the FINAL composite output - the truth probe.
 	sfxProbeBackBuffer();
 
