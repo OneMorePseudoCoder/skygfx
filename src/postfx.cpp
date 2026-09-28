@@ -1695,7 +1695,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30m) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30n) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2398,58 +2398,42 @@ sfxHDRclearFull(void)
 	d3d9device->Clear(0, nil, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
 }
 
-// ---- v9.30m: safe content probes -----------------------------------
-// v9.30l/l2 tried to read GPU rasters with RwRasterLock. Locking a
-// D3D9 render-target raster is illegal: the unlock re-uploaded a
-// stale/empty system-memory copy over the live buffer and painted the
-// whole frame black (user screenshots 71/72). These probes use only
-// the legal readback path: GetRenderTargetData into a SYSTEMMEM
-// offscreen surface - a plain GPU->CPU copy that cannot modify the
-// source - and then lock THAT surface. All calls checked; on the
-// first failure the probe reports once and switches itself off.
-// Sampling: the first 10 frames, then every 20th frame, plus every
-// frame while a burst is running (a burst starts when the verdict
-// changes, so white->normal->warm transitions are caught quickly).
-static int sfxProbeBBLast = -1;  // verdict: -1 unknown, 0 normal, 1 white, 2 black
+// ---- v9.30n: safe content probes (beige-aware, freeze-aware) --------
+// v9.30m proved the readback path (GetRenderTargetData into a SYSTEMMEM
+// surface) works on the user's machine and touches nothing. Its
+// classification was wrong though: the beige-out is NOT pure white
+// (red channel roughly 150-210 with a vignette gradient), so it fell
+// between the WHITE and BLACK tests and stayed silent. v9.30n adds an
+// explicit BEIGE band, samples the back buffer EVERY frame to detect
+// frozen output (identical hash while the user keeps moving the
+// camera - the warm snap marker) and prints on every verdict change.
+// Menu frames (uniform black) print nothing at all.
+static int sfxProbeFrame;			// heartbeat, ++ per DFE call
+static int sfxProbeBBLast = -1;	// verdict: -1 unknown, 0 normal, 1 white, 2 black, 3 beige
 static int sfxProbeBBBurst;
+static unsigned int sfxProbeBBHash;	// previous frame's hash
+static int sfxProbeBBSame;			// consecutive identical-frame count
 static int sfxProbeBBFail;
 static int sfxProbeHLast = -1;
 static int sfxProbeHBurst;
 static int sfxProbeHFail;
-static int sfxProbeBudget = 500;
+static int sfxProbeGame;			// set once the resolve has run (gameplay)
+static int sfxProbeBudget = 2000;
 
 static void
-sfxProbeVerdict(const char *tag, unsigned int h, int mn, int mx,
-                unsigned int p0, unsigned int pm,
-                int wthr, int bthr, int spthr, int *last, int *burst)
+sfxProbeOut(const char *tag, unsigned int h, int mn, int mx, int av,
+            unsigned int p0, unsigned int pm, const char *vs, const char *fs)
 {
-	int v = 0, print;
-	if(mx - mn < spthr){
-		if(mn > wthr) v = 1;
-		else if(mx < bthr) v = 2;
-	}
-	print = 0;
-	if(v != *last){
-		print = 1;
-		*burst = 24;
-	}else if(v != 0){
-		if((sfxFrameNo & 7) == 0)
-			print = 1;
-	}else if(sfxFrameNo < 10 || (sfxFrameNo % 240) == 0)
-		print = 1;
-	if(*burst > 0)
-		(*burst)--;
-	*last = v;
-	if(!print || sfxProbeBudget <= 0)
+	if(sfxProbeBudget-- <= 0)
 		return;
-	sfxProbeBudget--;
-	sfxLogLine("PROBE %s f=%u h=%08x mn=%d mx=%d p0=%08x pm=%08x%s\n",
-		tag, sfxFrameNo, h, mn, mx, p0, pm,
-		v == 1 ? " WHITE" : v == 2 ? " BLACK" : "");
+	sfxLogLine("PROBE %s f=%u pf=%d h=%08x mn=%d mx=%d av=%d p0=%08x pm=%08x%s%s\n",
+		tag, sfxFrameNo, sfxProbeFrame, h, mn, mx, av, p0, pm, vs, fs);
 }
 
 // Truth probe: what the player actually sees - the back buffer right
 // after the final composite quad, before HUD/fade draw on top.
+// Sampled EVERY frame (one GPU->CPU copy), printed on verdict changes,
+// short bursts, baselines every 90 frames and on freeze repeats.
 static void
 sfxProbeBackBuffer(void)
 {
@@ -2458,11 +2442,10 @@ sfxProbeBackBuffer(void)
 	D3DSURFACE_DESC d;
 	D3DLOCKED_RECT lr;
 	unsigned int s = 0, p0 = 0, pm = 0;
-	unsigned int f = sfxFrameNo;
-	int i, mn = 255, mx = 0;
+	unsigned int f = sfxProbeFrame++;
+	const char *vs, *fs;
+	int i, mn = 255, mx = 0, sum = 0, v;
 	if(dev == nil)
-		return;
-	if(sfxProbeBBBurst == 0 && f >= 10 && (f % 20) != 0)
 		return;
 	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || bb == nil)
 		return;
@@ -2480,21 +2463,56 @@ sfxProbeBackBuffer(void)
 		return;
 	}
 	for(i = 0; i < 64; i++){
-		unsigned int v = *(unsigned int*)((unsigned char*)lr.pBits
+		unsigned int c = *(unsigned int*)((unsigned char*)lr.pBits
 			+ (d.Height/16 + (i>>3)*(d.Height/8))*lr.Pitch
 			+ (d.Width/16 + (i&7)*(d.Width/8))*4);
-		int r = (int)(v & 0xFF);
-		s = s*31 + v;
+		int r = (int)(c & 0xFF);
+		s = s*31 + c;
+		sum += r;
 		if(r > mx) mx = r;
 		if(r < mn) mn = r;
-		if(i == 0) p0 = v;
-		if(i == 36) pm = v;
+		if(i == 0) p0 = c;
+		if(i == 36) pm = c;
 	}
 	sys->UnlockRect();
 	sys->Release();
 	bb->Release();
-	sfxProbeVerdict("BB", s, mn, mx, p0, pm, 230, 6, 12,
-	                &sfxProbeBBLast, &sfxProbeBBBurst);
+	// classify
+	if(mx < 6)				v = 2;
+	else if(mn > 230)		v = 1;
+	else if(mn > 90 && (sum/64) > 120)	v = 3;	// the beige-out band
+	else					v = 0;
+	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : "";
+	fs = "";
+	// frozen output: identical hash on consecutive frames while the
+	// game is running. Only meaningful while the camera is moving;
+	// throttled to one line per four repeats.
+	if(sfxProbeGame && s != 0 && s == sfxProbeBBHash){
+		sfxProbeBBSame++;
+		if((sfxProbeBBSame & 3) == 1)
+			sfxProbeOut("BB", s, mn, mx, sum/64, p0, pm, vs, " SAME");
+		vs = nil;
+	}else
+		sfxProbeBBSame = 0;
+	sfxProbeBBHash = s;
+	if(vs == nil)
+		return;
+	// print policy
+	if(v != sfxProbeBBLast){
+		if(!sfxProbeGame && v == 2){	// menu: black is expected, stay quiet
+			sfxProbeBBLast = v;
+			return;
+		}
+		sfxProbeBBBurst = 30;
+		sfxProbeOut("BB", s, mn, mx, sum/64, p0, pm, vs, fs);
+	}else if(v != 0){
+		if(sfxProbeBBBurst > 0 && (f & 3) == 0)
+			sfxProbeOut("BB", s, mn, mx, sum/64, p0, pm, vs, fs);
+	}else if(sfxProbeGame && (f % 90) == 0)
+		sfxProbeOut("BB", s, mn, mx, sum/64, p0, pm, vs, fs);
+	if(sfxProbeBBBurst > 0)
+		sfxProbeBBBurst--;
+	sfxProbeBBLast = v;
 }
 
 // FP16 scene content at resolve time (A16B16G16R16F, 8 bytes/px;
@@ -2507,11 +2525,11 @@ sfxProbeFP16(void)
 	D3DSURFACE_DESC d;
 	D3DLOCKED_RECT lr;
 	unsigned int s = 0, p0 = 0, pm = 0;
-	unsigned int f = sfxFrameNo;
-	int i, mn = 32767, mx = -32768;
+	int i, mn = 32767, mx = -32768, sum = 0, v;
 	if(dev == nil || src == nil)
 		return;
-	if(sfxProbeHBurst == 0 && f >= 10 && (f % 20) != 0)
+	sfxProbeGame = 1;		// resolve runs -> gameplay frames
+	if((sfxProbeFrame % 10) != 0)
 		return;
 	if(src->GetDesc(&d) != D3D_OK ||
 	   dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
@@ -2526,20 +2544,35 @@ sfxProbeFP16(void)
 		return;
 	}
 	for(i = 0; i < 32; i++){
-		unsigned int v = *(unsigned int*)((unsigned char*)lr.pBits
+		unsigned int c = *(unsigned int*)((unsigned char*)lr.pBits
 			+ (d.Height/16 + (i>>2)*(d.Height/8))*lr.Pitch
 			+ (d.Width/16 + (i&3)*(d.Width/8))*8);
-		int r = (int)(unsigned short)(v & 0xFFFF);
-		s = s*31 + v;
+		int r = (int)(unsigned short)(c & 0xFFFF);
+		s = s*31 + c;
+		sum += r;
 		if(r > mx) mx = r;
 		if(r < mn) mn = r;
-		if(i == 0) p0 = v;
-		if(i == 17) pm = v;
+		if(i == 0) p0 = c;
+		if(i == 17) pm = c;
 	}
 	sys->UnlockRect();
 	sys->Release();
-	sfxProbeVerdict("H16", s, mn, mx, p0, pm, 14000, 100, 800,
-	                &sfxProbeHLast, &sfxProbeHBurst);
+	if(mx < 100)			v = 2;
+	else if(mn > 14000)		v = 1;
+	else if(mn > 1500 && (sum/32) > 3000)	v = 3;
+	else					v = 0;
+	if(v != sfxProbeHLast){
+		sfxProbeHBurst = 30;
+		sfxProbeOut("H16", s, mn, mx, sum/32, p0, pm,
+			v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : "", "");
+	}else if(v != 0 && sfxProbeHBurst > 0 && (sfxProbeFrame & 7) == 0)
+		sfxProbeOut("H16", s, mn, mx, sum/32, p0, pm,
+			v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : "", "");
+	else if(v == 0 && (sfxProbeFrame % 90) == 0)
+		sfxProbeOut("H16", s, mn, mx, sum/32, p0, pm, "", "");
+	if(sfxProbeHBurst > 0)
+		sfxProbeHBurst--;
+	sfxProbeHLast = v;
 }
 
 // v9.30g: the sky, drawn the vanilla way, into the FP16 sub-rect.
