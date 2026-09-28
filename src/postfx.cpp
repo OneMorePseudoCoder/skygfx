@@ -211,7 +211,6 @@ static IDirect3DSurface9 *sfxSysCopy;
 static int sfxSysW, sfxSysH;
 static RwRaster *sfxLiveRaster;
 static int sfxLiveW, sfxLiveH;
-static int sfxLogU2;
 static int sfxLiveFilledAt = -1;
 
 static void
@@ -1876,7 +1875,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36a) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
