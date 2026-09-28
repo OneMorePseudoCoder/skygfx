@@ -1,0 +1,86 @@
+--- a/src/postfx.cpp
++++ b/src/postfx.cpp
+@@ -201,12 +201,10 @@
+-// back buffer -> front buffer, GPU to GPU. RwRasterPushContext points
+-// RW's own render target at the front buffer's D3D surface (the same
+-// pause-safe bracket the stock copy uses); GetRenderTarget hands that
+-// surface over and StretchRect copies the swap chain in one GPU
+-// operation. v9.36d: unlike the 9.34a/9.36 CPU readback (one cached
+-// upload per frame) every call copies what the back buffer holds
+-// RIGHT NOW - the vanilla UpdateFrontBuffer semantic, which the filter
+-// chain needs: each blur/filter/radiosity refresh re-reads the front
+-// buffer, so feeding it a frame-old cached image destroyed the chain's
+-// intermediate results (the 9.36c run: warm filter never visible).
+-// And unlike the 9.35 raw quad, no device state is touched
+-// (StretchRect bypasses render/sampler state; pause menu safe).
++// v9.36e: the 9.36d run failed EVERY call ("U2 live fill FAILED" from
++// the first resolve on): RwRasterPushContext defers the render-target
++// commit, so GetRenderTarget still reported the old target (the back
++// buffer) and the self-copy guard rejected everything - full stock
++// behaviour, the old symptoms back. This version copies through the
++// paths the game itself uses every frame: switch the camera raster to
++// the front buffer (the colour filter's own RwCameraSetRaster pattern)
++// and draw the camera raster as a full-screen textured quad with the
++// game's DrawQuad (the same textured-quad class the filter and the
++// deferred stretch use). Current pixels, RW-native, no device state.
+@@ -216,3 +214,2 @@
+-	IDirect3DSurface9 *bb = nil, *fbS = nil;
+-	int ok = 1;
+-	if(d3d9device == nil)
++	RwRaster *camR, *fb, *r;
++	if(Scene.camera == nil)
+@@ -220,2 +217,3 @@
+-	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
+-		|| bb == nil)
++	fb = CPostEffects::pRasterFrontBuffer;
++	camR = RwCameraGetRaster(Scene.camera);
++	if(fb == nil || camR == nil)
+@@ -223,10 +221,4 @@
+-	RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
+-	if(d3d9device->GetRenderTarget(0, &fbS) != D3D_OK || fbS == nil){
+-		ok = 0;
+-	}else if(fbS == bb){
+-		// PushContext did not switch targets: a self-copy would be a
+-		// no-op, report failure so the stock copy runs and logs it
+-		ok = 0;
+-	}else if(d3d9device->StretchRect(bb, nil, fbS, nil, D3DTEXF_NONE)
+-		!= D3D_OK){
+-		ok = 0;
++	if(fb == camR){
++		// early frames keep the camera on the same raster - the stock
++		// copy would copy the raster onto itself; skip, nothing to do
++		return 1;
+@@ -234,5 +226,9 @@
+-	if(fbS)
+-		fbS->Release();
+-	RwRasterPopContext();
+-	bb->Release();
+-	return ok;
++	RwCameraEndUpdate(Scene.camera);
++	RwCameraSetRaster(Scene.camera, fb);
++	RwCameraBeginUpdate(Scene.camera);
++	CPostEffects::DrawQuad(0.0f, 0.0f, (float)fb->width, (float)fb->height,
++		255, 255, 255, 255, camR);
++	RwCameraEndUpdate(Scene.camera);
++	RwCameraSetRaster(Scene.camera, camR);
++	RwCameraBeginUpdate(Scene.camera);
++	return 1;
+@@ -241,3 +237,3 @@
+-// v9.36: SEH wrapper. Copies the live back buffer into the front
+-// buffer (GPU-GPU, see sfxLiveCopyFB). Any fault falls back to the
+-// stock copy and disables the live path for good.
++// v9.36: SEH wrapper. Copies the live back buffer content into the
++// front buffer through sfxLiveCopyFB (camera-switch + DrawQuad). Any
++// fault falls back to the stock copy and disables the live path.
+@@ -290,3 +286,5 @@
+-	// snap. v9.36d: the copy is a GPU-GPU StretchRect (see
+-	// sfxLiveCopyFB) - the current back buffer every time, so the
+-	// every-refresh call matches the vanilla semantics exactly.
++	// snap. v9.36e: the copy is RW-native - the camera raster is
++	// switched to the front buffer and the camera raster drawn as one
++	// textured quad (see sfxLiveCopyFB) - the current back buffer
++	// every time, so the every-refresh call matches the vanilla
++	// semantics exactly.
+@@ -1829 +1827 @@
+-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36d) ====\n");
++		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36e) ====\n");
