@@ -156,9 +156,26 @@ struct Colorcycle
 
 
 
+// v9.30k: declared here (moved from the log section below) so that
+// UpdateFrontBuffer's diagnostic can use it - its first use is above that
+// section and MSVC rejects use-before-declaration (the v9.30j2 lesson)
+static FILE *sfxLog;
+
 void
 CPostEffects::UpdateFrontBuffer(void)
 {
+	// v9.30k: WHICH raster is the camera holding when the filter chain
+	// refreshes its front buffer? The colour filter / radiosity chain
+	// samples this raster, and with hdrBuffer the camera raster can
+	// momentarily disagree with the resolved back buffer (blur/radiosity
+	// swap the camera raster mid-chain). Log the identity for the first
+	// calls - a raster here that is NOT the main back buffer is the bug.
+	{ static int n = 0;
+	  RwRaster *r = RwCameraGetRaster(Scene.camera);
+	  if(sfxLog && r && n++ < 60)
+		  fprintf(sfxLog, "UF raster=%08x %dx%dx%d n=%d\n",
+			  (unsigned int)(void*)r, r->width, r->height, r->depth, n);
+	}
 	RwCameraEndUpdate(Scene.camera);
 	RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
 	RwRasterRenderFast(RwCameraGetRaster(Scene.camera), 0, 0);
@@ -1633,7 +1650,7 @@ static sfxD3D2ArgFn d3dGetDepthStencil;
 
 // --- diagnostics (renderScaleDebugLog=1): append D3D state events to
 // skygfx_renderScale.log in the game folder (first 20000 lines) ---
-static FILE *sfxLog;
+// (sfxLog moved above UpdateFrontBuffer in v9.30k - its diagnostic uses it)
 static int sfxLogCount;
 static int sfxLogV0, sfxLogT0, sfxLogOther; // caps for off-window events
 static int sfxLogT, sfxLogC, sfxLogS, sfxLogP; // caps for in-window events
@@ -1678,7 +1695,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30j2) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30k) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2792,6 +2809,17 @@ RenderScale_DeferredStretch(void)
 	if(sfxHDRon && sfxHDRresolve(camR)){
 		// resolved straight from the FP16 buffer; the RsGlobal and
 		// NoClear cleanup at the end of this function is shared
+		// v9.30k: refresh the filter front buffer from the freshly
+		// resolved back buffer RIGHT NOW. The colour filter and
+		// radiosity chain sample this raster, and with hdrBuffer the
+		// previous refresh could predate the resolve - stale/wrong
+		// input showed as the flat white frame and made the warm
+		// look snap with camera movement (hdr=1 only per user A/B).
+		CPostEffects::UpdateFrontBuffer();
+		{ static int ufr = 0;
+		  if(ufr++ < 20)
+			  sfxLogLine("R2 fbrefresh after resolve\n");
+		}
 	}else if(camR != nil && (sfxStretchRaster != nil
 			|| ensureStretchRaster(camR->width, camR->height, camR->depth))){
 		// full viewport first - the stretch quad is placed in
