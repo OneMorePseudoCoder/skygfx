@@ -1227,6 +1227,33 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 			keystate = false;
 	}
 
+	// v9.30j: blank-front-buffer guard. If the front buffer raster was
+	// (re)created this frame (window resize / device churn right after a
+	// new game), the PS2 filter samples an EMPTY raster and the whole
+	// screen turns flat beige for a few frames until the next refresh.
+	// Detect the identity/size change and refresh from the live back
+	// buffer before the filter reads it - one extra quad, only on the
+	// change frame.
+	{
+		static RwRaster *lastFB;
+		static int lastW, lastH;
+		RwRaster *fb = pRasterFrontBuffer;
+		int w = fb ? RwRasterGetWidth(fb) : 0;
+		int h = fb ? RwRasterGetHeight(fb) : 0;
+		if(fb != lastFB || w != lastW || h != lastH){
+			if(sfxLogCF++ < 40)
+				sfxLogLine("CF fbchange %08x %dx%d (was %08x %dx%d)\n",
+					(unsigned int)(void*)fb, w, h,
+					(unsigned int)(void*)lastFB, lastW, lastH);
+			if(fb != nil){
+				UpdateFrontBuffer();
+				lastFB = fb;
+				lastW = w;
+				lastH = h;
+			}
+		}
+	}
+
 	RwRGBA rgb1pc = rgb1;
 	RwRGBA rgb2pc = rgb2;
 
@@ -1645,7 +1672,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30i) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30j) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1695,6 +1722,7 @@ static int sfxLogXF;
 static int sfxLogDFE;
 static int sfxLogVP;
 static int sfxLogCL;
+static int sfxLogCF;
 static void sfxHDRclearFull(void);
 static void sfxSkyDraw(const struct SfxD3DViewport *svp);
 
