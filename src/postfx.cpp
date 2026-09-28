@@ -160,6 +160,10 @@ struct Colorcycle
 // UpdateFrontBuffer's diagnostic can use it - its first use is above that
 // section and MSVC rejects use-before-declaration (the v9.30j2 lesson)
 static FILE *sfxLog;
+// v9.34a: sfxProbeFrame lives up here - UpdateFrontBuffer gates its
+// per-frame fill cache on it (C2065 in CI build a3254a3: it used to
+// be declared ~1600 lines below this first use)
+static int sfxProbeFrame;			// heartbeat, ++ per DFE call
 
 // ---- v9.32: live front buffer for the hdr path ----------------------
 // The 931-run log proved cam==bb:1 - the camera raster IS the
@@ -241,8 +245,8 @@ sfxBBtoFB(int w, int h)
 	// swap chain). Copy only the intersection - reading the source
 	// beyond the back-buffer-sized system copy was the v9.32a crash
 	// (fault registers: row stride 0x2000 = 2048px, 0x400 = 1024 rows).
-	cw = d.Width < w ? d.Width : w;
-	ch = d.Height < h ? d.Height : h;
+	cw = (int)d.Width < w ? (int)d.Width : w;
+	ch = (int)d.Height < h ? (int)d.Height : h;
 	if(cw <= 0 || ch <= 0)
 		return 0;
 	if(sfxLiveRaster == nil || sfxLiveW != cw || sfxLiveH != ch){
@@ -1845,7 +1849,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.34) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.34a) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2560,7 +2564,6 @@ sfxHDRclearFull(void)
 // frozen output (identical hash while the user keeps moving the
 // camera - the warm snap marker) and prints on every verdict change.
 // Menu frames (uniform black) print nothing at all.
-static int sfxProbeFrame;			// heartbeat, ++ per DFE call
 static int sfxProbeBBLast = -1;	// verdict: -1 unknown, 0 normal, 1 white, 2 black, 3 beige
 static int sfxProbeBBBurst;
 static unsigned int sfxProbeBBHash;	// previous frame's hash
