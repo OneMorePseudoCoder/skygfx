@@ -1645,7 +1645,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30g) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.30i) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1689,6 +1689,12 @@ static int sfxHDRresolve(RwRaster *camR);
 // resolve stretches it back - vanilla "nothing is ever cleared"
 // semantics, no game bytes touched.
 static int sfxLogCap;	// v9.30g: sky-call log cap (sfxLogS is taken, C2086)
+// v9.30i blink/shadow diagnostics: frame counter + per-stream line budgets
+static unsigned int sfxFrameNo;
+static int sfxLogXF;
+static int sfxLogDFE;
+static int sfxLogVP;
+static int sfxLogCL;
 static void sfxHDRclearFull(void);
 static void sfxSkyDraw(const struct SfxD3DViewport *svp);
 
@@ -1816,6 +1822,11 @@ static int __stdcall
 sfxSetViewportHook(void *dev, void *vp)
 {
 	struct SfxD3DViewport *v = (struct SfxD3DViewport*)vp;
+	// v9.30i: every viewport for the first 20 frames - shows the shadow
+	// passes' small viewports and any full-size passthrough vs the window
+	if(sfxFrameNo < 20 && sfxLogVP++ < 1000)
+		sfxLogLine("VP f=%u %ux%u win=%d inSc=%d\n",
+			sfxFrameNo, v->width, v->height, (int)sfxScaleActive, (int)sfxScaleInScene);
 	if(sfxScaleActive){
 		if(v->width == sfxSceneW && v->height == sfxSceneH){
 			struct SfxD3DViewport c = {0, 0, sfxScaleW, sfxScaleH, 0.0f, 1.0f};
@@ -1842,6 +1853,10 @@ static int __stdcall
 sfxClearHook(void *dev, unsigned int count, void *rects,
 	unsigned int flags, unsigned int color, float z, unsigned int stencil)
 {
+	// v9.30i: every clear for the first 20 frames - shadow/scene clears
+	// vs the scale window, next to the VP trace
+	if(sfxFrameNo < 20 && sfxLogCL++ < 1000)
+		sfxLogLine("CL f=%u flags=%x win=%d\n", sfxFrameNo, flags, (int)sfxScaleActive);
 	// v9.30c: RW binds the camera raster (the back buffer) at every
 	// camera begin and THEN issues the camera's clear - so without
 	// this, the FP16 target was never cleared and every frame drew
@@ -2356,9 +2371,12 @@ sfxSkyDraw(const struct SfxD3DViewport *svp)
 	// sub-rect. Pointer calls only - zero game bytes patched.
 	((void (*)(void))0x734650)();	// DefinedState - vanilla render states
 	((void (*)(void))0x714650)();	// CClouds::RenderSkyPolys - the gradient
-	((void (*)(void))0x713950)();	// CClouds::Render - sun/moon/clouds
+	// v9.30i: the CClouds::Render (0x713950) replay is gone - Idle's
+	// RenderScene already calls CClouds::Render mid-scene into the fp16
+	// buffer (the g2 sun/moon/clouds came from THAT call), so the replay
+	// rendered the whole sun/moon/cloud set twice per frame.
 	if(sfxLogCap++ < 2000)
-		sfxLogLine("SKY drawn into fp16 sub-rect (gradient+clouds, vanilla fns, no patches)\n");
+		sfxLogLine("SKY gradient drawn into fp16 sub-rect (vanilla fns, no patches)\n");
 }
 
 void
@@ -2713,6 +2731,14 @@ RenderScale_DeferredStretch(void)
 {
 	RwRaster *camR;
 	sfxStretchPending = 0;
+	sfxFrameNo++;
+	// v9.30i: golden-hour extra colour state - the vanilla timecycle
+	// system ramps m_ExtraColourInter (0..1) when the camera faces the
+	// low sun, warming the whole filter; correlates with the reported
+	// ON/OFF "blink" (warm while driving towards the sun, pale away)
+	if(sfxLogXF++ < 600)
+		sfxLogLine("XF f=%u inter=%.2f on=%d ec=%d\n",
+			sfxFrameNo, *(float*)0xB79E3C, *(int*)0xB7C484, *(int*)0xB79E44);
 	// v9.20: use the REAL camera raster and un-swap the frameBuffer
 	// FIRST. v9.19 read the still-swapped 1200x676 dims raster here, so
 	// the stretch quad only covered the sub-rect 1:1 (broken looking
@@ -2806,6 +2832,10 @@ CPostEffects::DrawFinalEffects(void)
 		}
 		sfxVpScaled = 0;
 	}
+	// v9.30i: proof-of-life marker - if the mod post chain (bloom,
+	// exposure, vignette) ever stops on a machine, these lines stop
+	if(sfxLogDFE++ < 600)
+		sfxLogLine("DFE n=%d\n", sfxLogDFE);
 
 	bool doYCbCr = m_bYCbCrFilter;
 	bool doBloom = config->doBloom;
