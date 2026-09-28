@@ -1,0 +1,213 @@
+--- a/src/postfx.cpp
++++ b/src/postfx.cpp
+@@ -201,82 +201,12 @@
+-// back buffer -> front buffer. Readback: GetRenderTargetData into a
+-// SYSTEMMEM copy (legal, one-way), upload into our own texture raster
+-// (lock/unlock - the proven dither pattern), then write the front
+-// buffer through the VANILLA path (PushContext + RwRasterRenderFast)
+-// - the same write the stock copy uses, just fed with live pixels.
+-// The v9.35 raw-D3D quad write was reverted: it corrupted pause-menu
+-// rendering (screenshot 79). The CPU readback is cached once per
+-// frame (9.34a proved that costs nothing measurable; the v9.33 drop
+-// was 2-3 readbacks per frame).
+-static IDirect3DSurface9 *sfxSysCopy;
+-static int sfxSysW, sfxSysH;
+-static RwRaster *sfxLiveRaster;
+-static int sfxLiveW, sfxLiveH;
+-static int sfxLiveFilledAt = -1;
+-static int sfxLogUF;				// bounded log: upload failures
+-
+-static void
+-sfxLiveUpload(void)
+-{
+-	IDirect3DDevice9 *dev = d3d9device;
+-	IDirect3DSurface9 *bb = nil;
+-	D3DSURFACE_DESC d;
+-	D3DLOCKED_RECT lr;
+-	RwUInt8 *dst;
+-	int y, cw, ch;
+-	if(dev == nil)
+-		return;
+-	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
+-		|| bb == nil)
+-		return;
+-	if(bb->GetDesc(&d) != D3D_OK){
+-		bb->Release();
+-		return;
+-	}
+-	if(sfxSysCopy == nil || sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
+-		if(sfxSysCopy)
+-			sfxSysCopy->Release();
+-		sfxSysCopy = nil;
+-		if(dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+-			D3DPOOL_SYSTEMMEM, &sfxSysCopy, nil) != D3D_OK){
+-			sfxSysCopy = nil;
+-			bb->Release();
+-			return;
+-		}
+-		sfxSysW = (int)d.Width;
+-		sfxSysH = (int)d.Height;
+-	}
+-	if(dev->GetRenderTargetData(bb, sfxSysCopy) != D3D_OK){
+-		bb->Release();
+-		return;
+-	}
+-	bb->Release();
+-	if(sfxLiveRaster == nil || sfxLiveW != sfxSysW || sfxLiveH != sfxSysH){
+-		if(sfxLiveRaster)
+-			RwRasterDestroy(sfxLiveRaster);
+-		sfxLiveRaster = nil;
+-		sfxLiveRaster = RwRasterCreate(sfxSysW, sfxSysH, 32,
+-			rwRASTERTYPECAMERATEXTURE);
+-		if(sfxLiveRaster == nil)
+-			return;
+-		sfxLiveW = sfxSysW;
+-		sfxLiveH = sfxSysH;
+-	}
+-	if(sfxSysCopy->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK)
+-		return;
+-	dst = (RwUInt8*)RwRasterLock(sfxLiveRaster, 0, 1);
+-	if(dst == nil){
+-		sfxSysCopy->UnlockRect();
+-		return;
+-	}
+-	cw = sfxSysW;
+-	ch = sfxSysH;
+-	for(y = 0; y < ch; y++)
+-		memcpy(dst + y*cw*4, (RwUInt8*)lr.pBits + y*lr.Pitch, cw*4);
+-	RwRasterUnlock(sfxLiveRaster);
+-	sfxSysCopy->UnlockRect();
+-	sfxLiveFilledAt = sfxProbeFrame;
+-}
+-
+-// write the cached live image into the front buffer - vanilla write
+-static void
+-sfxLiveBlitFB(void)
++// v9.36e: the 9.36d run failed EVERY call ("U2 live fill FAILED" from
++// the first resolve on): RwRasterPushContext defers the render-target
++// commit, so GetRenderTarget still reported the old target (the back
++// buffer) and the self-copy guard rejected everything - full stock
++// behaviour, the old symptoms back. This version copies through the
++// paths the game itself uses every frame: switch the camera raster to
++// the front buffer (the colour filter's own RwCameraSetRaster pattern)
++// and draw the camera raster as a full-screen textured quad with the
++// game's DrawQuad (the same textured-quad class the filter and the
++// deferred stretch use). Current pixels, RW-native, no device state.
++static int
++sfxLiveCopyFB(void)
+@@ -284,6 +214,11 @@
+-	RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
+-	RwRasterRenderFast(sfxLiveRaster, 0, 0);
+-	RwRasterPopContext();
+-	if(sfxLog && sfxLogU2 < 8){
+-		sfxLogU2++;
+-		fprintf(sfxLog, "U2 live fb %dx%d\n", sfxLiveW, sfxLiveH);
++	RwRaster *camR, *fb, *r;
++	if(Scene.camera == nil)
++		return 0;
++	fb = CPostEffects::pRasterFrontBuffer;
++	camR = RwCameraGetRaster(Scene.camera);
++	if(fb == nil || camR == nil)
++		return 0;
++	if(fb == camR){
++		// early frames keep the camera on the same raster - the stock
++		// copy would copy the raster onto itself; skip, nothing to do
++		return 1;
+@@ -290,0 +226,9 @@
++	RwCameraEndUpdate(Scene.camera);
++	RwCameraSetRaster(Scene.camera, fb);
++	RwCameraBeginUpdate(Scene.camera);
++	CPostEffects::DrawQuad(0.0f, 0.0f, (float)fb->width, (float)fb->height,
++		255, 255, 255, 255, camR);
++	RwCameraEndUpdate(Scene.camera);
++	RwCameraSetRaster(Scene.camera, camR);
++	RwCameraBeginUpdate(Scene.camera);
++	return 1;
+@@ -293,9 +237,3 @@
+-// v9.36: SEH wrapper. Uploads the live back buffer ONCE per frame
+-// (cached) and blits it into the front buffer with the vanilla write
+-// path - safe for the pause menu (no raw D3D state touched).
+-// v9.36b: the raster is CREATED inside sfxLiveUpload, so requiring it
+-// before the first upload was a chicken-and-egg that disabled the
+-// whole path (the 9.36a run: zero "U2 live fb" lines - stock fill all
+-// session). Only pRasterFrontBuffer gates the entry now; a failed
+-// upload falls back to the stock copy for that call.
+-
++// v9.36: SEH wrapper. Copies the live back buffer content into the
++// front buffer through sfxLiveCopyFB (camera-switch + DrawQuad). Any
++// fault falls back to the stock copy and disables the live path.
+@@ -306 +244 @@
+-	if(CPostEffects::pRasterFrontBuffer == nil || sfxLiveRaster == nil)
++	if(CPostEffects::pRasterFrontBuffer == nil)
+@@ -309,6 +247 @@
+-		if(sfxLiveFilledAt != sfxProbeFrame)
+-			sfxLiveUpload();
+-		if(sfxLiveRaster != nil)
+-			sfxLiveBlitFB();
+-		else
+-			ok = 0;
++		ok = sfxLiveCopyFB();
+@@ -321,0 +255,6 @@
++	if(ok && sfxLog && sfxLogU2 < 8){
++		sfxLogU2++;
++		fprintf(sfxLog, "U2 live fb %dx%d\n",
++			CPostEffects::pRasterFrontBuffer->width,
++			CPostEffects::pRasterFrontBuffer->height);
++	}
+@@ -329 +267,0 @@
+-
+@@ -348,3 +286,3 @@
+-	// snap. v9.36: the write is the vanilla RW path again (the raw
+-	// D3D quad corrupted the pause menu); the CPU readback is cached
+-	// once per frame like 9.34a, so every-refresh stays affordable.
++	// snap. v9.36d: the copy is a GPU-GPU StretchRect (see
++	// sfxLiveCopyFB) - the current back buffer every time, so the
++	// every-refresh call matches the vanilla semantics exactly.
+@@ -1887 +1825 @@
+-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36b) ====\n");
++		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36e) ====\n");
+@@ -2638 +2576 @@
+-	int i, mn = 255, mx = 0, sum = 0, v;
++	int i, mn = 255, mx = 0, sum = 0, sumR = 0, v;
+@@ -2669 +2607 @@
+-@@SR@@
++		sumR += (int)((c >> 16) & 0xFF);
+@@ -2678,5 +2616,8 @@
+-	// classify. v9.36: the SAT band - the yellow full-screen state has
+-	// a bright average but dark HUD specks drag mn down, which blinded
+-	// the old BEIGE test (that is why the yellow episodes never
+-	// printed). c&0xFF is the blue channel of the ARGB dword.
+-	if(mx < 6)				v = 2;
++	// classify. v9.36c: the yellow full-screen state is a CHANNEL
++	// property - saturated yellow has blue ~0 and red ~255, which
++	// blue-only stats reported as BLACK or missed entirely; red vs
++	// blue averages separate it from night (all channels low). The
++	// 9.36a run also proved the old BEIGE test fires on a bright sky
++	// (f=529 p0=ff6199e1), so beige now requires warmth: avgR > avgB.
++	if(sumR/64 > 110 && sum/64 < 60)	v = 4;	// yellow-out
++	else if(mx < 6)				v = 2;
+@@ -2684,2 +2625,2 @@
+-	else if(mn > 90 && (sum/64) > 120)	v = 3;	// beige-out band
+-	else if((sum/64) > 110 && mn <= 90)	v = 4;	// saturated + HUD
++	else if(mn > 90 && (sum/64) > 120
++				       && sumR/64 > sum/64)	v = 3;	// warm beige
+@@ -2687 +2628 @@
+-	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : v == 4 ? " SAT" : "";
++	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : v == 4 ? " YELLOW" : "";
+@@ -2751 +2692 @@
+-	int i, mn = 255, mx = 0, sum = 0, v;
++	int i, mn = 255, mx = 0, sum = 0, sumR = 0, v;
+@@ -2781 +2722 @@
+-@@SR@@
++		sumR += (int)((c >> 16) & 0xFF);
+@@ -2790 +2731,2 @@
+-	if(mx < 6)				v = 2;
++	if(sumR/64 > 110 && sum/64 < 60)	v = 4;	// yellow-out
++	else if(mx < 6)				v = 2;
+@@ -2792 +2734,2 @@
+-	else if(mn > 90 && (sum/64) > 120)	v = 3;
++	else if(mn > 90 && (sum/64) > 120
++				       && sumR/64 > sum/64)	v = 3;	// warm beige
+@@ -2794 +2737 @@
+-	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : "";
++	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : v == 4 ? " YELLOW" : "";
