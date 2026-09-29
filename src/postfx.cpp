@@ -2038,7 +2038,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.55) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.56) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3452,7 +3452,13 @@ sfxHDRresolve(RwRaster *camR)
 	// frame). Which states are stale depends on what the camera sees -
 	// hence the pitch correlation. Save them, log when armed, kill.
 	DWORD oldSc = 0, oldAt = 0, oldSt = 0;
-	HRESULT hr;
+	// v9.56: the LAST unchecked silent killer. Shadow rendering (the
+	// user runs stencil shadows) classically leaves COLORWRITEENABLE
+	// at 0 - every draw after it "succeeds" but writes no pixels:
+	// the resolve quad lands on nothing, the back buffer freezes, and
+	// the whole post chain accumulates on the stale frame.
+	DWORD oldCw = 0;
+	HRESULT hr, qhr;
 	float uw, vh;
 	int i;
 	if(d3d9device == nil || sfxHDRsurf == nil || camR == nil)
@@ -3471,12 +3477,13 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldSc);
 	d3d9device->GetRenderState(D3DRS_ALPHATESTENABLE, &oldAt);
 	d3d9device->GetRenderState(D3DRS_STENCILENABLE, &oldSt);
+	d3d9device->GetRenderState(D3DRS_COLORWRITEENABLE, &oldCw);
 	{
 		static int sfxLogClip;
-		if((oldSc || oldAt || oldSt) && sfxLogClip < 12){
+		if((oldSc || oldAt || oldSt || oldCw != 0xF) && sfxLogClip < 12){
 			sfxLogClip++;
-			sfxLogLine("H2 clip states: scissor=%u atest=%u stencil=%u\n",
-				oldSc, oldAt, oldSt);
+			sfxLogLine("H2 clip states: scissor=%u atest=%u stencil=%u colwrite=%u\n",
+				oldSc, oldAt, oldSt, oldCw);
 		}
 	}
 	// full viewport first - the quad is placed in full-raster coordinates
@@ -3508,6 +3515,7 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
 	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 	d3d9device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
 	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 	d3d9device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
@@ -3578,7 +3586,14 @@ sfxHDRresolve(RwRaster *camR)
 		d3d9device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
 		d3d9device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
 		d3d9device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-		d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(struct HDRVtx));
+		qhr = d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(struct HDRVtx));
+		if(qhr != D3D_OK){
+			static int sfxLogQ;
+			if(sfxLogQ < 8){
+				sfxLogQ++;
+				sfxLogLine("H2 quad DrawPrimitiveUP FAILED hr=%08x\n", (unsigned int)qhr);
+			}
+		}
 		// restore exactly what was there - RW keeps its own state cache
 		d3d9device->SetTextureStageState(0, D3DTSS_COLOROP, ocop);
 		d3d9device->SetTextureStageState(0, D3DTSS_COLORARG1, oarg1);
@@ -3600,6 +3615,7 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, oldSc);
 	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, oldAt);
 	d3d9device->SetRenderState(D3DRS_STENCILENABLE, oldSt);
+	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, oldCw);
 	sfxHDRon = 0;
 	RwCameraBeginUpdate(Scene.camera);
 	if(sfxLogR++ < 2000)
