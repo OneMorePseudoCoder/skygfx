@@ -257,6 +257,20 @@ sfxLiveCopyFB(void)
 	return 1;
 }
 
+// v9.37: once-per-frame gate. The stock copy serves RW's STALE raster
+// copy at every refresh, which is CONSTANT within one frame - all
+// passes (filter, radiosity, composite) read the same image. The live
+// fill at every refresh fed each pass a DIFFERENT image instead (the
+// filter passes themselves redraw the back buffer between refreshes -
+// intra-frame feedback): the g run's dim steady state, the blur snap
+// and the pitch-triggered white flashes (looking up/down changes the
+// radiosity/extra-colour thresholds, the refresh pattern follows, the
+// feedback changes with it; left/right keeps one pattern - just dim).
+// Fill ONCE per frame - the first refresh after the resolve lands the
+// live resolved image - and let every later refresh keep it: the
+// 9.34a cadence, minus the CPU readback.
+static int sfxLiveFilledAt = -1;
+
 // v9.36: SEH wrapper. Copies the live back buffer content into the
 // front buffer through sfxLiveCopyFB (PushContext bracket + Im2D
 // quad). Any fault falls back to the stock copy and disables the
@@ -268,7 +282,10 @@ sfxHDRfillLive(void)
 	if(CPostEffects::pRasterFrontBuffer == nil)
 		return 0;
 	__try{
-		ok = sfxLiveCopyFB();
+		if(sfxLiveFilledAt != sfxProbeFrame){
+			if(sfxLiveCopyFB())
+				sfxLiveFilledAt = sfxProbeFrame;
+		}
 	}
 	__except(EXCEPTION_EXECUTE_HANDLER){
 		ok = 0;
@@ -1849,7 +1866,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36g) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.37) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
