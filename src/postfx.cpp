@@ -651,6 +651,11 @@ CPostEffects::DrawQuadSetDefaultUVs(void)
 static int sfxLogRad;
 static int sfxLogRad2;
 static int sfxLogDK;
+// v9.45: call-presence counters - the DeferredStretch per-frame section
+// compares them against last frame to detect the vanilla gate SKIPPING a
+// call (a binary skip of the filter/glow draw = the suspected ON/OFF snap)
+static unsigned int sfxRadSeq;
+static unsigned int sfxDKSeq;
 static void sfxLogLine(const char *fmt, ...);
 
 void *blurPS, *radiosityPS;
@@ -757,6 +762,7 @@ CPostEffects::Radiosity_shader(int intensityLimit, int filterPasses, int renderP
 void
 CPostEffects::Radiosity(int intensityLimit, int filterPasses, int renderPasses, int intensity)
 {
+	sfxRadSeq++;
 /*
 	{
 		static bool keystate = false;
@@ -963,6 +969,7 @@ CPostEffects::Radiosity(int intensityLimit, int filterPasses, int renderPasses, 
 void
 CPostEffects::DarknessFilter_fix(uint8 alpha)
 {
+	sfxDKSeq++;
 	// v9.44: trace what the vanilla caller feeds the darkness filter -
 	// a binary flip here would also read as a hard night ON/OFF.
 	{
@@ -1374,11 +1381,19 @@ CPostEffects::Grain_PS2(int strength, bool generate)
 // them here instead (re-declaring a static function prototype is legal).
 static int sfxLogCF;
 static int sfxLogCSmooth;
+// v9.45: bridge state - seq increments on every filter call, the last
+// drawn colours let the always-running coronas stub redraw the filter
+// on frames the vanilla gate skips it
+static unsigned int sfxCFSeq;
+static int sfxCFDrawOK;
+static RwRGBA sfxCFLast1;
+static RwRGBA sfxCFLast2;
 static void sfxLogLine(const char *fmt, ...);
 
 void
 CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 {
+	sfxCFSeq++;
 	{
 		static bool keystate = false;
 		if(GetAsyncKeyState(config->keys[0]) & 0x8000){
@@ -1466,13 +1481,15 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 	// snap. Approach the target colours at 16%/frame instead - a sub-second
 	// fade - and log sizeable jumps so the mechanism stays visible.
 	{
-		static int s1r = -1, s1g, s1b, s2r, s2g, s2b;
+		static int s1r = -1, s1g, s1b, s2r, s2g, s2b, s1a, s2a;
 		int jR = (int)rgb1.red - s1r, jG = (int)rgb1.green - s1g, jB = (int)rgb1.blue - s1b;
 		int kR = (int)rgb2.red - s2r, kG = (int)rgb2.green - s2g, kB = (int)rgb2.blue - s2b;
+		int jA1 = (int)rgb1.alpha - s1a, jA2 = (int)rgb2.alpha - s2a;
 		if(s1r < 0){
 			s1r = rgb1.red; s1g = rgb1.green; s1b = rgb1.blue;
 			s2r = rgb2.red; s2g = rgb2.green; s2b = rgb2.blue;
-			jR = jG = jB = kR = kG = kB = 0;
+			s1a = rgb1.alpha; s2a = rgb2.alpha;
+			jR = jG = jB = kR = kG = kB = jA1 = jA2 = 0;
 		}
 		if(jR < -1 || jR > 1) s1r += jR * 16 / 100;
 		if(jG < -1 || jG > 1) s1g += jG * 16 / 100;
@@ -1480,20 +1497,36 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 		if(kR < -1 || kR > 1) s2r += kR * 16 / 100;
 		if(kG < -1 || kG > 1) s2g += kG * 16 / 100;
 		if(kB < -1 || kB > 1) s2b += kB * 16 / 100;
+		if(jA1 < -1 || jA1 > 1) s1a += jA1 * 16 / 100;
+		if(jA2 < -1 || jA2 > 1) s2a += jA2 * 16 / 100;
 		rgb1.red = (unsigned char)s1r;
 		rgb1.green = (unsigned char)s1g;
 		rgb1.blue = (unsigned char)s1b;
 		rgb2.red = (unsigned char)s2r;
 		rgb2.green = (unsigned char)s2g;
 		rgb2.blue = (unsigned char)s2b;
+		rgb1.alpha = (unsigned char)s1a;
+		rgb2.alpha = (unsigned char)s2a;
 		if(sfxLogCSmooth < 40 &&
 		   ((jR < -24 || jR > 24) || (jG < -24 || jG > 24) || (jB < -24 || jB > 24) ||
-		    (kR < -24 || kR > 24) || (kG < -24 || kG > 24) || (kB < -24 || kB > 24))){
+		    (kR < -24 || kR > 24) || (kG < -24 || kG > 24) || (kB < -24 || kB > 24) ||
+		    (jA1 < -24 || jA1 > 24) || (jA2 < -24 || jA2 > 24))){
 			sfxLogCSmooth++;
-			sfxLogLine("CFSMOOTH jump1=%d,%d,%d jump2=%d,%d,%d\n",
-				jR, jG, jB, kR, kG, kB);
+			sfxLogLine("CFSMOOTH jump1=%d,%d,%d,%d jump2=%d,%d,%d,%d\n",
+				jR, jG, jB, jA1, kR, kG, kB, jA2);
 		}
 	}
+
+	// v9.45: remember the colours actually drawn so a skipped frame can
+	// be bridged from the coronas stub, and log the full filter colours
+	// periodically (alpha included - previous logs were alpha-blind).
+	sfxCFLast1 = rgb1;
+	sfxCFLast2 = rgb2;
+	sfxCFDrawOK = 1;
+	if((sfxCFSeq & 15) == 0)
+		sfxLogLine("CFC seq=%u c1=%d,%d,%d,%d c2=%d,%d,%d,%d\n",
+			sfxCFSeq, rgb1.red, rgb1.green, rgb1.blue, rgb1.alpha,
+			rgb2.red, rgb2.green, rgb2.blue, rgb2.alpha);
 
 	vcsblurrgb = rgb2;
 
@@ -1885,7 +1918,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.44) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.45) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3448,6 +3481,60 @@ RenderScale_DeferredStretch(void)
 		sfxCamAngles(&sfxPit, &sfxHea);
 		sfxLogLine("XF f=%u inter=%.2f on=%d ec=%d p=%d h=%d\n",
 			sfxFrameNo, *(float*)0xB79E3C, *(int*)0xB7C484, *(int*)0xB79E44, sfxPit, sfxHea);
+	}
+	// v9.45: did the vanilla post-effect calls actually run this frame?
+	// A count that did not advance since last frame means the vanilla
+	// gate in front of the call site skipped it - a binary skip of the
+	// filter/glow draw reads as the ON/OFF snap. The colour filter is
+	// BRIDGED: redraw the last colours for up to 24 frames, ramping to
+	// neutral (the fade statics inside the filter chase the ramp, so
+	// both the skip and the resume fade instead of popping).
+	{
+		static unsigned int xCF, xRad, xDK;
+		static int cfSkip, radSkip, dkSkip;
+		if(sfxCFSeq != xCF){
+			if(cfSkip > 0)
+				sfxLogLine("CFRESUME seq=%u skipped=%d\n", sfxCFSeq, cfSkip);
+			cfSkip = 0;
+		}else if(sfxCFDrawOK && sfxProbeGame){
+			cfSkip++;
+			if(cfSkip <= 24){
+				int k = (24 - cfSkip) * 100 / 24;
+				RwRGBA f1 = sfxCFLast1, f2 = sfxCFLast2;
+				f1.red   = (unsigned char)(128 + ((int)f1.red   - 128) * k / 100);
+				f1.green = (unsigned char)(128 + ((int)f1.green - 128) * k / 100);
+				f1.blue  = (unsigned char)(128 + ((int)f1.blue  - 128) * k / 100);
+				f2.red   = (unsigned char)((int)f2.red   * k / 100);
+				f2.green = (unsigned char)((int)f2.green * k / 100);
+				f2.blue  = (unsigned char)((int)f2.blue  * k / 100);
+				f2.alpha = (unsigned char)((int)f2.alpha * k / 100);
+				CPostEffects::ColourFilter_switch(f1, f2);
+			}
+			if(cfSkip == 1 || cfSkip == 24 || (cfSkip == 25 + 64 * ((cfSkip - 25) / 64) && cfSkip > 24))
+				sfxLogLine("CFGAP f=%u n=%d\n", sfxFrameNo, cfSkip);
+		}else if(sfxCFDrawOK){
+			cfSkip++;
+			if(cfSkip == 1 || cfSkip == 120)
+				sfxLogLine("CFGAP f=%u n=%d (no bridge: not in game)\n", sfxFrameNo, cfSkip);
+		}
+		xCF = sfxCFSeq;
+		if(sfxRadSeq != xRad){
+			if(radSkip > 0)
+				sfxLogLine("RADRESUME seq=%u skipped=%d\n", sfxRadSeq, radSkip);
+			radSkip = 0;
+		}else{
+			radSkip++;
+			if(radSkip == 1 || radSkip == 30 || (radSkip & 127) == 0)
+				sfxLogLine("RADGAP f=%u n=%d\n", sfxFrameNo, radSkip);
+		}
+		xRad = sfxRadSeq;
+		if(sfxDKSeq == xDK){
+			dkSkip++;
+			if(dkSkip == 1 || dkSkip == 120)
+				sfxLogLine("DKGAP f=%u n=%d\n", sfxFrameNo, dkSkip);
+		}else
+			dkSkip = 0;
+		xDK = sfxDKSeq;
 	}
 	// v9.20: use the REAL camera raster and un-swap the frameBuffer
 	// FIRST. v9.19 read the still-swapped 1200x676 dims raster here, so
