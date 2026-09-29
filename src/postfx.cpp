@@ -1760,7 +1760,7 @@ static int sfxW2DNoClear;
 static int sfxW2DZStripped;
 static int sfxLogZ, sfxLogZ0, sfxLogDS;
 static int sfxLogQ;
-static int sfxLogB, sfxLogR;
+static int sfxLogB, sfxLogR, sfxLogPS;
 static int sfxLogH;
 static void sfxHDRbind(void);
 // v9.19: the end-of-frame stretch is deferred out of RenderScale_EndOfScene
@@ -1784,7 +1784,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.39) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.40) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3138,7 +3138,32 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
 	d3d9device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
 	d3d9device->SetTexture(0, (IDirect3DTexture9*)sfxHDRtex);
+	// v9.40: the resolve quad is fixed-function. The filter chain can leave
+	// its own pixel shader bound (which pass runs last depends on what is on
+	// screen - hence the pitch correlation), and a stray PS samples through
+	// foreign sampler state: opaque white across the whole frame. Kill it.
+	IDirect3DPixelShader9 *sfxOldPS = nil;
+	d3d9device->GetPixelShader(&sfxOldPS);
+	if(sfxOldPS != nil){
+		d3d9device->SetPixelShader(nil);
+		if(sfxLogPS < 6){
+			sfxLogPS++;
+			sfxLogLine("H2 stray pixel shader %p killed before resolve\n", sfxOldPS);
+		}
+		sfxOldPS->Release();
+	}
 	d3d9device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+	// v9.40: verify the FP16 texture really became sampler 0. D3D9 samples
+	// an unbound/foreign sampler as opaque white, so a silent bind failure
+	// would reproduce the same white episodes - log it once if so.
+	IDirect3DBaseTexture9 *sfxBnd = nil;
+	d3d9device->GetTexture(0, &sfxBnd);
+	if(sfxBnd != (IDirect3DBaseTexture9*)sfxHDRtex && sfxLogPS < 6){
+		sfxLogPS++;
+		sfxLogLine("H2 bind mismatch got=%p want=%p\n", sfxBnd, sfxHDRtex);
+	}
+	if(sfxBnd)
+		sfxBnd->Release();
 	uw = (float)sfxScaleW / (float)sfxHDRw;
 	vh = (float)sfxScaleH / (float)sfxHDRh;
 	v[0].x = -0.5f;	v[0].y = -0.5f;	v[0].u = 0.0f;	v[0].v = 0.0f;
