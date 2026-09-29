@@ -1410,36 +1410,75 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 {
 	sfxCFSeq++;
 
-	// v9.48: THE SNAP FIX. With hdrBuffer=1 the camera raster IS the
-	// swap-chain back buffer, and the stock RW copy that feeds the
-	// filter texture (pRasterFrontBuffer) reads RW's never-resynced
-	// stale system copy of it. The filter therefore blended a feedback
-	// image - its own previous output carried back through the stale
-	// copy and the radiosity scratch copies - converging to a
-	// saturated green-yellow equilibrium; whenever RW happened to
-	// re-sync (the resyncs correlated with camera angle changes) the
-	// texture jumped back to a clean warm frame - the binary
-	// green/warm snap the user sees at night. hdrBuffer=0 uses a
-	// normal RW-managed raster whose stock copy is always fresh, so
-	// it never snapped.
-	// Fix: copy the LIVE back buffer into the filter texture here,
-	// once per frame, BEFORE the filter draws. The filter and the
-	// glow/composite that follow now always read THIS frame's clean
-	// scene and no stage output can feed back into the texture - the
-	// feedback loop is broken by construction. Stock push/pop bracket
-	// (pause-safe); pointer/state only, no game bytes patched.
-	if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
+	// v9.49: THE SNAP FIX, second attempt. v9.48 filled the filter
+	// texture with RwRasterRenderFast(sfxBBRaster) - but for the
+	// swap-chain back buffer that call reads RW's stale system copy,
+	// the exact source the stock copy uses, so it was a no-op (the
+	// snap survived) and the render-from-backbuffer path is also the
+	// prime suspect for the pause-menu black screen. This version
+	// reads the LIVE back buffer through the proven
+	// GetRenderTargetData path (the same one every probe uses) into
+	// a CPU raster and blits THAT into the filter texture, once per
+	// frame, before the filter draws. The filter (and the glow and
+	// the composite that follow) then always blend THIS frame's clean
+	// scene and no stage output can feed back through a stale copy.
+	// Skipped when the camera is not on the back buffer (radiosity
+	// ping-pong passes keep the stock path). Readback is
+	// GetRenderTargetData -> systemmem surface -> LockRect READONLY;
+	// the CPU raster is a plain texture raster (the proven dither
+	// pattern). No game bytes are patched.
+	{
 		static unsigned int lastCopyToken = 0;
-		if(lastCopyToken != (unsigned int)sfxProbeFrame){
+		static RwRaster *freshRaster;
+		static int freshW, freshH;
+		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
+		   lastCopyToken != (unsigned int)sfxProbeFrame){
+			IDirect3DSurface9 *bb = nil, *sys = nil;
+			D3DSURFACE_DESC d;
+			D3DLOCKED_RECT lr;
 			lastCopyToken = (unsigned int)sfxProbeFrame;
-			RwCameraEndUpdate(Scene.camera);
-			RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
-			RwRasterRenderFast(sfxBBRaster, 0, 0);
-			RwRasterPopContext();
-			RwCameraBeginUpdate(Scene.camera);
-			if(sfxLogFresh < 40){
-				sfxLogFresh++;
-				sfxLogLine("CF freshcopy n=%d seq=%u\n", sfxLogFresh, sfxCFSeq);
+			if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil){
+				if(bb->GetDesc(&d) == D3D_OK &&
+				   d3d9device->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+				                                          D3DPOOL_SYSTEMMEM, &sys, nil) == D3D_OK &&
+				   d3d9device->GetRenderTargetData(bb, sys) == D3D_OK &&
+				   sys->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
+					if(freshRaster == nil ||
+					   freshW != (int)d.Width || freshH != (int)d.Height){
+						if(freshRaster)
+							RwRasterDestroy(freshRaster);
+						freshRaster = RwRasterCreate((int)d.Width, (int)d.Height, 32,
+							rwRASTERTYPETEXTURE | rwRASTERFORMAT8888);
+						freshW = d.Width;
+						freshH = d.Height;
+					}
+					if(freshRaster != nil){
+						unsigned char *dst = (unsigned char*)RwRasterLock(freshRaster, 0, 1);
+						if(dst != nil){
+							const unsigned char *srcrow = (const unsigned char*)lr.pBits;
+							int dstpitch = RwRasterGetWidth(freshRaster) * 4;
+							int y, rows = (int)d.Height, cw = (int)d.Width * 4;
+							for(y = 0; y < rows; y++)
+								memcpy(dst + (size_t)y*dstpitch, srcrow + (size_t)y*lr.Pitch, cw);
+							RwRasterUnlock(freshRaster);
+							RwCameraEndUpdate(Scene.camera);
+							RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
+							RwRasterRenderFast(freshRaster, 0, 0);
+							RwRasterPopContext();
+							RwCameraBeginUpdate(Scene.camera);
+							if(sfxLogFresh < 40){
+								sfxLogFresh++;
+								sfxLogLine("CF freshcopy n=%d seq=%u %dx%d\n",
+									sfxLogFresh, sfxCFSeq, (int)d.Width, (int)d.Height);
+							}
+						}
+					}
+				}
+				if(sys){
+					sys->UnlockRect();
+					sys->Release();
+				}
+				bb->Release();
 			}
 		}
 	}
@@ -1967,7 +2006,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.48) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.49) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
