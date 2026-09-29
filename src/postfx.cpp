@@ -216,7 +216,18 @@ sfxBBRegister(RwRaster *camR)
 // GetRenderTarget probe) and draws the camera raster as one
 // full-screen quad using the exact state pattern of the proven
 // callers (default UVs, straight SRCALPHA/INVSRCALPHA copy, vertex
-// colour 255). RW-native, nothing left behind.
+// colour 255).
+// v9.36g: the f2 run (log aqKkGYeG) showed the fill target is the
+// colour filter's own PADDED front buffer - 2048x1024 for a 1600x900
+// screen (the "U2 live fb 2048x1024" / "CF fbchange ... 2048x1024"
+// lines) - and the stock copy lands the image 1:1 in its top-left
+// corner (RwRasterRenderFast(camR, 0, 0)); the filter UVs read exactly
+// that sub-rect. f2 sized the quad from the TARGET (2048x1024) and
+// stretched the 1600x900 camera raster across the whole padded raster,
+// so the filter read a zoomed crop - the dim steady state, the blur
+// snap (radiosity smearing the zoomed composite) and the
+// angle-triggered white flashes. The quad now covers the camera
+// raster's own rect - 1:1, exactly where the stock copy puts it.
 static int
 sfxLiveCopyFB(void)
 {
@@ -239,7 +250,7 @@ sfxLiveCopyFB(void)
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
 	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
 	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
-	CPostEffects::DrawQuad(0.0f, 0.0f, (float)fb->width, (float)fb->height,
+	CPostEffects::DrawQuad(0.0f, 0.0f, (float)camR->width, (float)camR->height,
 		255, 255, 255, 255, camR);
 	CPostEffects::ImmediateModeRenderStatesReStore();
 	RwRasterPopContext();
@@ -296,11 +307,12 @@ CPostEffects::UpdateFrontBuffer(void)
 	// filled AFTER the filter had already read last frame's content -
 	// a same-frame feedback loop that accumulated into the blurred
 	// warm wash (screenshot 76), the white-out peaks and the warm
-	// snap. v9.36f: the copy runs in the vanilla write bracket
-	// (RwRasterPushContext) and draws the camera raster as one
-	// full-screen quad with the proven caller state pattern (see
-	// sfxLiveCopyFB) - the current back buffer every time, so the
-	// every-refresh call matches the vanilla semantics exactly.
+	// snap. v9.36g: the copy runs in the vanilla write bracket
+	// (RwRasterPushContext) and lands the camera raster 1:1 in the
+	// filter's padded front buffer with the proven caller state
+	// pattern (see sfxLiveCopyFB) - the current back buffer every
+	// time, so the every-refresh call matches the vanilla semantics
+	// exactly.
 	if(sfxHDRready && sfxBBRaster != nil
 		&& RwCameraGetRaster(Scene.camera) == sfxBBRaster){
 		if(sfxHDRfillLive())
@@ -1837,7 +1849,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36f2) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36g) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
