@@ -187,6 +187,9 @@ static RwRaster *sfxBBRaster;		// the swap-chain-backed camera raster
 static RwRaster *sfxLiveRaster;
 static int sfxLiveW, sfxLiveH;
 static int sfxLogLive;
+// v9.50b: forward declaration - UpdateFrontBuffer logs before the
+// declaration block further down (CI C3861)
+static void sfxLogLine(const char *fmt, ...);
 static int sfxLogU2;
 static int sfxLogBR;
 
