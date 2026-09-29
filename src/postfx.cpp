@@ -191,6 +191,13 @@ static int sfxLogLive;
 // released one three times per frame - most of the added FPS drop)
 static IDirect3DSurface9 *sfxSysSurf;
 static int sfxSysW, sfxSysH;
+// v9.54: hybrid fill - the first refresh of a frame does the live
+// readback (correctness anchor, recursion stays dead); the later
+// refreshes re-upload THIS frame's cached clean copy (cheap CPU
+// upload, no GPU->CPU readback). The v9.53 T lines measured the
+// readback at 8-16ms per frame = 44-72% of the whole frame.
+static unsigned int sfxUFLiveToken = 0;
+static int sfxLogFast;
 // v9.53: per-frame timing - microseconds spent in UpdateFrontBuffer
 // (the live readback) and the full frame (DFE heartbeat), so the log
 // quantifies exactly what the readback costs on this machine
@@ -325,6 +332,22 @@ CPostEffects::UpdateFrontBuffer(void)
 		// the log) so moving the copy fully onto the GPU is decided
 		// on data, not guesswork.
 		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
+		   sfxUFLiveToken == (unsigned int)sfxProbeFrame && sfxLiveRaster != nil){
+			// v9.54: 2nd/3rd refresh of this frame - re-upload the
+			// cached clean copy instead of reading the back buffer
+			// again. Consumers (radiosity source, composite scene)
+			// get THIS frame's clean scene, not the blur scratch and
+			// not a stale copy - and the per-frame readback count
+			// drops from three to one.
+			RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
+			RwRasterRenderFast(sfxLiveRaster, 0, 0);
+			RwRasterPopContext();
+			done = 1;
+			if(sfxLogFast < 40){
+				sfxLogFast++;
+				sfxLogLine("UF2 fast n=%d pf=%d\n", sfxLogFast, sfxProbeFrame);
+			}
+		}else if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
 		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil &&
 		   bb->GetDesc(&d) == D3D_OK){
 			if(sfxSysSurf == nil ||
@@ -364,6 +387,7 @@ CPostEffects::UpdateFrontBuffer(void)
 					RwRasterRenderFast(sfxLiveRaster, 0, 0);
 					RwRasterPopContext();
 					done = 1;
+					sfxUFLiveToken = (unsigned int)sfxProbeFrame;
 					if(sfxLogLive < 40){
 						sfxLogLive++;
 						sfxLogLine("UF2 fill n=%d %dx%d pf=%d\n", sfxLogLive, sfxLiveW, sfxLiveH, sfxProbeFrame);
@@ -2014,7 +2038,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.53) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.54) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
