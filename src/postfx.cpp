@@ -645,6 +645,14 @@ CPostEffects::DrawQuadSetDefaultUVs(void)
 	DrawQuadSetUVs(0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f);
 }
 
+// v9.44: radiosity/darkness diagnostics - must be declared before
+// CPostEffects::Radiosity / DarknessFilter_fix below (the log helper and
+// its counters live further down in this file).
+static int sfxLogRad;
+static int sfxLogRad2;
+static int sfxLogDK;
+static void sfxLogLine(const char *fmt, ...);
+
 void *blurPS, *radiosityPS;
 
 void
@@ -771,6 +779,51 @@ CPostEffects::Radiosity(int intensityLimit, int filterPasses, int renderPasses, 
 
 	if(!config->doRadiosity)
 		return;
+
+	// v9.44: the vanilla caller can flip the radiosity glow hard ON/OFF
+	// (night hours only, camera-angle dependent). Trace every target
+	// change, and fade intensity/limit towards the vanilla target at
+	// 16%/frame instead of following the flip instantly - the pop
+	// becomes a sub-second fade. filterPasses/renderPasses stay as-is;
+	// if the RAD target lines show those flipping, the next step
+	// handles them.
+	{
+		static int tLim = -1, tInt = -1;
+		if(intensityLimit != tLim || intensity != tInt){
+			tLim = intensityLimit;
+			tInt = intensity;
+			if(sfxLogRad < 60){
+				sfxLogRad++;
+				sfxLogLine("RAD target lim=%d inten=%d passes=%d/%d gb=%d gi=%d\n",
+					intensityLimit, intensity, filterPasses, renderPasses,
+					(int)CPostEffects::m_bRadiosity,
+					CPostEffects::m_RadiosityIntensity);
+			}
+		}
+		{
+			static int sLim = -1, sInt = -1;
+			if(sLim < 0){
+				sLim = intensityLimit;
+				sInt = intensity;
+			}
+			int dl = intensityLimit - sLim;
+			int di = intensity - sInt;
+			if(dl < -1 || dl > 1) sLim += dl * 16 / 100;
+			if(di < -1 || di > 1) sInt += di * 16 / 100;
+			if(sLim < 0) sLim = 0;
+			if(sLim > 255) sLim = 255;
+			if(sInt < 0) sInt = 0;
+			if(sInt > 255) sInt = 255;
+			if(sfxLogRad2 < 48 &&
+			   ((di < -8 || di > 8) || (dl < -8 || dl > 8))){
+				sfxLogRad2++;
+				sfxLogLine("RADSMOOTH dl=%d di=%d lim=%d->%d inten=%d->%d\n",
+					dl, di, intensityLimit, sLim, intensity, sInt);
+			}
+			intensityLimit = sLim;
+			intensity = sInt;
+		}
+	}
 
 	if(config->radiosity == 1){
 		Radiosity_shader(intensityLimit, filterPasses, renderPasses, intensity);
@@ -910,6 +963,18 @@ CPostEffects::Radiosity(int intensityLimit, int filterPasses, int renderPasses, 
 void
 CPostEffects::DarknessFilter_fix(uint8 alpha)
 {
+	// v9.44: trace what the vanilla caller feeds the darkness filter -
+	// a binary flip here would also read as a hard night ON/OFF.
+	{
+		static int lastA = -1;
+		if((int)alpha != lastA){
+			lastA = (int)alpha;
+			if(sfxLogDK < 40)
+				sfxLogLine("DK alpha=%d bDF=%d\n",
+					(int)alpha,
+					(int)(CPostEffects::m_bDarknessFilter ? 1 : 0));
+		}
+	}
 	DarknessFilter(alpha);
 	UpdateFrontBuffer();
 }
@@ -1820,7 +1885,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.43b) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.44) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
