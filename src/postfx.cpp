@@ -1784,7 +1784,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.41) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.42) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2643,6 +2643,11 @@ static unsigned int sfxProbeRBHash;
 static int sfxProbeRBSame;
 static int sfxProbeRBFail;
 static int sfxProbeWhiteDiag;
+// v9.42: full-frame colour-average tracking for snap detection; the 64-dot
+// grid verdict only catches extreme episodes, a warm/pale snap during camera
+// motion slips through between samples - the frame-to-frame delta does not.
+static int sfxProbeAvR = -1, sfxProbeAvG, sfxProbeAvB;
+static int sfxProbeSnapSeq, sfxProbeSnapBudget = 60;
 static void
 sfxProbeResolveBB(void)
 {
@@ -2673,6 +2678,35 @@ sfxProbeResolveBB(void)
 		if(sys) sys->Release();
 		bb->Release();
 		return;
+	}
+	{
+		// v9.42: full-frame colour average (16x9 grid over the already-locked
+		// surface - no extra readback). A jump larger than 30 total units
+		// between two samples while the game is running is a SNAP candidate;
+		// logged with the extra-colour state so the cause is identifiable.
+		int sr = 0, sg = 0, sb = 0, si;
+		for(si = 0; si < 144; si++){
+			unsigned int sc = *(unsigned int*)((unsigned char*)lr.pBits
+				+ (d.Height/18 + (si/16)*(d.Height/9))*lr.Pitch
+				+ (d.Width/32 + (si%16)*(d.Width/16))*4);
+			sr += (int)((sc >> 16) & 0xFF);
+			sg += (int)((sc >> 8) & 0xFF);
+			sb += (int)(sc & 0xFF);
+		}
+		{
+			int avR = sr/144, avG = sg/144, avB = sb/144;
+			if(sfxProbeAvR >= 0 && sfxProbeGame){
+				int dR = avR - sfxProbeAvR, dG = avG - sfxProbeAvG, dB = avB - sfxProbeAvB;
+				int mag = (dR < 0 ? -dR : dR) + (dG < 0 ? -dG : dG) + (dB < 0 ? -dB : dB);
+				if(mag > 30 && sfxProbeSnapBudget > 0 && (sfxProbeSnapSeq++ % 8) == 0){
+					sfxProbeSnapBudget--;
+					sfxLogLine("SNAP f=%u d=%d,%d,%d av=%d,%d,%d xf=%.2f/%d\n",
+						sfxFrameNo, dR, dG, dB, avR, avG, avB,
+						*(float*)0xB79E3C, *(int*)0xB7C484);
+				}
+			}
+			sfxProbeAvR = avR; sfxProbeAvG = avG; sfxProbeAvB = avB;
+		}
 	}
 	for(i = 0; i < 64; i++){
 		unsigned int c = *(unsigned int*)((unsigned char*)lr.pBits
@@ -3283,9 +3317,20 @@ RenderScale_DeferredStretch(void)
 	// system ramps m_ExtraColourInter (0..1) when the camera faces the
 	// low sun, warming the whole filter; correlates with the reported
 	// ON/OFF "blink" (warm while driving towards the sun, pale away)
-	if(sfxLogXF++ < 600)
-		sfxLogLine("XF f=%u inter=%.2f on=%d ec=%d\n",
-			sfxFrameNo, *(float*)0xB79E3C, *(int*)0xB7C484, *(int*)0xB79E44);
+	if(sfxLogXF++ < 600){
+		RwFrame *sfxCf = RwCameraGetFrame(Scene.camera);
+		RwMatrix *sfxCm = sfxCf ? RwFrameGetMatrix(sfxCf) : nil;
+		int sfxPit = 0, sfxHea = 0;
+		if(sfxCm){
+			float sfxAz = sfxCm->at.z;
+			if(sfxAz > 1.0f) sfxAz = 1.0f;
+			if(sfxAz < -1.0f) sfxAz = -1.0f;
+			sfxPit = (int)(asinf(sfxAz) * 57.2958f);
+			sfxHea = (int)(atan2f(sfxCm->at.y, sfxCm->at.x) * 57.2958f);
+		}
+		sfxLogLine("XF f=%u inter=%.2f on=%d ec=%d p=%d h=%d\n",
+			sfxFrameNo, *(float*)0xB79E3C, *(int*)0xB7C484, *(int*)0xB79E44, sfxPit, sfxHea);
+	}
 	// v9.20: use the REAL camera raster and un-swap the frameBuffer
 	// FIRST. v9.19 read the still-swapped 1200x676 dims raster here, so
 	// the stretch quad only covered the sub-rect 1:1 (broken looking
