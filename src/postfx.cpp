@@ -1308,6 +1308,7 @@ CPostEffects::Grain_PS2(int strength, bool generate)
 // runs BEFORE the log section below declares these - C2065/C3861. Declare
 // them here instead (re-declaring a static function prototype is legal).
 static int sfxLogCF;
+static int sfxLogCSmooth;
 static void sfxLogLine(const char *fmt, ...);
 
 void
@@ -1424,8 +1425,8 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 		   ((jR < -24 || jR > 24) || (jG < -24 || jG > 24) || (jB < -24 || jB > 24) ||
 		    (kR < -24 || kR > 24) || (kG < -24 || kG > 24) || (kB < -24 || kB > 24))){
 			sfxLogCSmooth++;
-			sfxLogLine("CFSMOOTH f=%u jump1=%d,%d,%d jump2=%d,%d,%d\n",
-				sfxFrameNo, jR, jG, jB, kR, kG, kB);
+			sfxLogLine("CFSMOOTH jump1=%d,%d,%d jump2=%d,%d,%d\n",
+				jR, jG, jB, kR, kG, kB);
 		}
 	}
 
@@ -1819,7 +1820,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.43) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.43b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2684,7 +2685,6 @@ static int sfxProbeWhiteDiag;
 static int sfxProbeAvR = -1, sfxProbeAvG, sfxProbeAvB;
 static int sfxProbeSnapSeq, sfxProbeSnapBudget = 120;
 static int sfxProbeAvSeq;
-static int sfxLogCSmooth;
 // v9.43: camera direction helper shared by the colour/angle logs
 static void
 sfxCamAngles(int *pit, int *hea)
