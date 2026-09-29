@@ -1394,6 +1394,41 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 	rgb2.green *= config->rgb2Mult;
 	rgb2.blue *= config->rgb2Mult;
 
+	// v9.43: the vanilla filter colours jump binary when the extra colour
+	// engages (camera facing the low sun). On the fp16 path the resolved
+	// frame is bright enough that the jump reads as a harsh warm ON/OFF
+	// snap. Approach the target colours at 16%/frame instead - a sub-second
+	// fade - and log sizeable jumps so the mechanism stays visible.
+	{
+		static int s1r = -1, s1g, s1b, s2r, s2g, s2b;
+		int jR = (int)rgb1.red - s1r, jG = (int)rgb1.green - s1g, jB = (int)rgb1.blue - s1b;
+		int kR = (int)rgb2.red - s2r, kG = (int)rgb2.green - s2g, kB = (int)rgb2.blue - s2b;
+		if(s1r < 0){
+			s1r = rgb1.red; s1g = rgb1.green; s1b = rgb1.blue;
+			s2r = rgb2.red; s2g = rgb2.green; s2b = rgb2.blue;
+			jR = jG = jB = kR = kG = kB = 0;
+		}
+		if(jR < -1 || jR > 1) s1r += jR * 16 / 100;
+		if(jG < -1 || jG > 1) s1g += jG * 16 / 100;
+		if(jB < -1 || jB > 1) s1b += jB * 16 / 100;
+		if(kR < -1 || kR > 1) s2r += kR * 16 / 100;
+		if(kG < -1 || kG > 1) s2g += kG * 16 / 100;
+		if(kB < -1 || kB > 1) s2b += kB * 16 / 100;
+		rgb1.red = (unsigned char)s1r;
+		rgb1.green = (unsigned char)s1g;
+		rgb1.blue = (unsigned char)s1b;
+		rgb2.red = (unsigned char)s2r;
+		rgb2.green = (unsigned char)s2g;
+		rgb2.blue = (unsigned char)s2b;
+		if(sfxLogCSmooth < 40 &&
+		   ((jR < -24 || jR > 24) || (jG < -24 || jG > 24) || (jB < -24 || jB > 24) ||
+		    (kR < -24 || kR > 24) || (kG < -24 || kG > 24) || (kB < -24 || kB > 24))){
+			sfxLogCSmooth++;
+			sfxLogLine("CFSMOOTH f=%u jump1=%d,%d,%d jump2=%d,%d,%d\n",
+				sfxFrameNo, jR, jG, jB, kR, kG, kB);
+		}
+	}
+
 	vcsblurrgb = rgb2;
 
 	int colorFilter = config->colorFilter;
@@ -1784,7 +1819,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.42) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.43) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2647,7 +2682,24 @@ static int sfxProbeWhiteDiag;
 // grid verdict only catches extreme episodes, a warm/pale snap during camera
 // motion slips through between samples - the frame-to-frame delta does not.
 static int sfxProbeAvR = -1, sfxProbeAvG, sfxProbeAvB;
-static int sfxProbeSnapSeq, sfxProbeSnapBudget = 60;
+static int sfxProbeSnapSeq, sfxProbeSnapBudget = 120;
+static int sfxProbeAvSeq;
+static int sfxLogCSmooth;
+// v9.43: camera direction helper shared by the colour/angle logs
+static void
+sfxCamAngles(int *pit, int *hea)
+{
+	RwFrame *sfxAf = RwCameraGetFrame(Scene.camera);
+	RwMatrix *sfxAm = sfxAf ? RwFrameGetMatrix(sfxAf) : nil;
+	*pit = 0; *hea = 0;
+	if(sfxAm){
+		float sfxAz = sfxAm->at.z;
+		if(sfxAz > 1.0f) sfxAz = 1.0f;
+		if(sfxAz < -1.0f) sfxAz = -1.0f;
+		*pit = (int)(asinf(sfxAz) * 57.2958f);
+		*hea = (int)(atan2f(sfxAm->at.y, sfxAm->at.x) * 57.2958f);
+	}
+}
 static void
 sfxProbeResolveBB(void)
 {
@@ -2698,11 +2750,20 @@ sfxProbeResolveBB(void)
 			if(sfxProbeAvR >= 0 && sfxProbeGame){
 				int dR = avR - sfxProbeAvR, dG = avG - sfxProbeAvG, dB = avB - sfxProbeAvB;
 				int mag = (dR < 0 ? -dR : dR) + (dG < 0 ? -dG : dG) + (dB < 0 ? -dB : dB);
-				if(mag > 30 && sfxProbeSnapBudget > 0 && (sfxProbeSnapSeq++ % 8) == 0){
+				if(mag > 12 && sfxProbeSnapBudget > 0 && (sfxProbeSnapSeq++ % 8) == 0){
 					sfxProbeSnapBudget--;
 					sfxLogLine("SNAP f=%u d=%d,%d,%d av=%d,%d,%d xf=%.2f/%d\n",
 						sfxFrameNo, dR, dG, dB, avR, avG, avB,
 						*(float*)0xB79E3C, *(int*)0xB7C484);
+				}
+				// v9.43: continuous colour-vs-angle timeline (every 4th probe
+				// sample, ~0.6 s apart) - catches subtle warm shifts the
+				// SNAP threshold misses and pairs them with the camera angle.
+				if((sfxProbeAvSeq++ & 3) == 0){
+					int avP, avH;
+					sfxCamAngles(&avP, &avH);
+					sfxLogLine("AV f=%u av=%d,%d,%d d=%d,%d,%d p=%d h=%d\n",
+						sfxFrameNo, avR, avG, avB, dR, dG, dB, avP, avH);
 				}
 			}
 			sfxProbeAvR = avR; sfxProbeAvG = avG; sfxProbeAvB = avB;
@@ -3317,17 +3378,9 @@ RenderScale_DeferredStretch(void)
 	// system ramps m_ExtraColourInter (0..1) when the camera faces the
 	// low sun, warming the whole filter; correlates with the reported
 	// ON/OFF "blink" (warm while driving towards the sun, pale away)
-	if(sfxLogXF++ < 600){
-		RwFrame *sfxCf = RwCameraGetFrame(Scene.camera);
-		RwMatrix *sfxCm = sfxCf ? RwFrameGetMatrix(sfxCf) : nil;
-		int sfxPit = 0, sfxHea = 0;
-		if(sfxCm){
-			float sfxAz = sfxCm->at.z;
-			if(sfxAz > 1.0f) sfxAz = 1.0f;
-			if(sfxAz < -1.0f) sfxAz = -1.0f;
-			sfxPit = (int)(asinf(sfxAz) * 57.2958f);
-			sfxHea = (int)(atan2f(sfxCm->at.y, sfxCm->at.x) * 57.2958f);
-		}
+	if(sfxLogXF++ < 4000){
+		int sfxPit, sfxHea;
+		sfxCamAngles(&sfxPit, &sfxHea);
 		sfxLogLine("XF f=%u inter=%.2f on=%d ec=%d p=%d h=%d\n",
 			sfxFrameNo, *(float*)0xB79E3C, *(int*)0xB7C484, *(int*)0xB79E44, sfxPit, sfxHea);
 	}
