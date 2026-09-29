@@ -191,6 +191,7 @@ static int sfxLogLive;
 // released one three times per frame - most of the added FPS drop)
 static IDirect3DSurface9 *sfxSysSurf;
 static int sfxSysW, sfxSysH;
+static int sfxLogSkip;
 // v9.50b: forward declaration - UpdateFrontBuffer logs before the
 // declaration block further down (CI C3861)
 static void sfxLogLine(const char *fmt, ...);
@@ -304,13 +305,43 @@ CPostEffects::UpdateFrontBuffer(void)
 		D3DSURFACE_DESC d;
 		D3DLOCKED_RECT lr;
 		int done = 0, locked = 0;
+		// v9.52: THE FEEDBACK KILL + THE FPS FIX. The v9.51 log caught
+		// the bifurcation red-handed: at every visible jump (SNAPF) the
+		// fp16 scene surface was normal and smooth (H16S), while the
+		// BACK BUFFER flipped green/warm - and at f=889 the back buffer
+		// was pure black for a frame while fp16 held the full scene.
+		// The flip therefore lives in the post-resolve half, and the
+		// only bb->bb channel there is this copy chain: the back
+		// buffer was copied into the front raster THREE times per
+		// frame and radiosity/composite sample that raster back onto
+		// the back buffer - a per-frame RECURSION with stable states
+		// (green/warm/black) that camera swings tip between. The black
+		// attractor also explains the pause black/white background:
+		// pausing freezes a black frame. And the triple readback was
+		// the FPS drop. Fix: fill the front raster ONCE per frame,
+		// immediately after the scene resolve (the back buffer then
+		// holds THIS frame's clean scene - a pure function of the
+		// scene, no feedback), and make the later refreshes no-ops.
+		static unsigned int sfxUFLiveToken = 0;
 		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
+		   sfxUFLiveToken == (unsigned int)sfxProbeFrame){
+			// 2nd/3rd refresh of this frame: skip - neither the live
+			// fill (it would re-introduce the recursion) nor the stale
+			// stock copy; leave the clean fill in place
+			done = 1;
+			if(sfxLogSkip < 20){
+				sfxLogSkip++;
+				sfxLogLine("UF2 skip n=%d pf=%d\n", sfxLogSkip, sfxProbeFrame);
+			}
+		}else if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
 		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil &&
 		   bb->GetDesc(&d) == D3D_OK){
-			// v9.51: the staging surface is cached and reused; the
-			// readback itself still runs on every call so the fill
-			// semantics stay vanilla (post-filter for radiosity,
-			// post-effect for the composite)
+			sfxUFLiveToken = (unsigned int)sfxProbeFrame;
+			// v9.52: at this point (first refresh of the frame, right
+			// after the scene resolve) the back buffer holds THIS
+			// frame's clean scene - copying it now is a pure function
+			// of the scene, so nothing of frame n-1 can leak into
+			// frame n through this raster anymore
 			if(sfxSysSurf == nil ||
 			   sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
 				if(sfxSysSurf)
@@ -350,7 +381,7 @@ CPostEffects::UpdateFrontBuffer(void)
 					done = 1;
 					if(sfxLogLive < 40){
 						sfxLogLive++;
-						sfxLogLine("UF2 live fb n=%d %dx%d\n", sfxLogLive, sfxLiveW, sfxLiveH);
+						sfxLogLine("UF2 clean n=%d %dx%d pf=%d\n", sfxLogLive, sfxLiveW, sfxLiveH, sfxProbeFrame);
 					}
 				}
 			}
@@ -360,11 +391,19 @@ CPostEffects::UpdateFrontBuffer(void)
 			sfxSysSurf->UnlockRect();
 		if(bb)
 			bb->Release();
+		if(!done && sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
+			// v9.52: readback fault with the camera on the presented
+			// buffer - copy RW's cached copy WITHOUT the camera-context
+			// pair (BeginUpdate would clear the presented back buffer)
+			RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
+			RwRasterRenderFast(RwCameraGetRaster(Scene.camera), 0, 0);
+			RwRasterPopContext();
+			done = 1;
+		}
 		if(!done){
-			// stock copy path (camera on a work raster, or readback
-			// fault): the vanilla EndUpdate/BeginUpdate pair is safe
-			// here because BeginUpdate clears the WORK raster, never
-			// the presented back buffer
+			// camera on a work raster (radiosity ping-pong): the
+			// vanilla copy path - BeginUpdate clears the WORK raster,
+			// never the presented back buffer
 			RwCameraEndUpdate(Scene.camera);
 			RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
 			RwRasterRenderFast(RwCameraGetRaster(Scene.camera), 0, 0);
@@ -1983,7 +2022,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.51) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.52) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
