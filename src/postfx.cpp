@@ -2642,8 +2642,8 @@ static int sfxProbeRBBurst;
 static unsigned int sfxProbeRBHash;
 static int sfxProbeRBSame;
 static int sfxProbeRBFail;
-static void
 static int sfxProbeWhiteDiag;
+static void
 sfxProbeResolveBB(void)
 {
 	IDirect3DDevice9 *dev = d3d9device;
@@ -2697,7 +2697,6 @@ sfxProbeResolveBB(void)
 				       && sumR/64 > sum/64)	v = 3;	// warm beige
 	else					v = 0;
 	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : v == 4 ? " YELLOW" : "";
-	if(s != 0 && s == sfxProbeRBHash){
 	// v9.41: at a white resolve output, snapshot the FP16 content and the
 	// live stage-0 state. fp16 values are read as the red half float;
 	// 15360 == 1.0, so mn>15360 proves the source texel data itself was
@@ -2737,6 +2736,7 @@ sfxProbeResolveBB(void)
 		if(hsys)
 			hsys->Release();
 	}
+	if(s != 0 && s == sfxProbeRBHash){
 		sfxProbeRBSame++;
 		if((sfxProbeRBSame & 3) == 1)
 			sfxProbeOut("RB", s, mn, mx, sum/64, p0, pm, vs, " SAME");
