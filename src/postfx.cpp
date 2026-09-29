@@ -651,6 +651,7 @@ CPostEffects::DrawQuadSetDefaultUVs(void)
 static int sfxLogRad;
 static int sfxLogRad2;
 static int sfxLogDK;
+static int sfxLogRadRun;
 // v9.45: call-presence counters - the DeferredStretch per-frame section
 // compares them against last frame to detect the vanilla gate SKIPPING a
 // call (a binary skip of the filter/glow draw = the suspected ON/OFF snap)
@@ -664,6 +665,12 @@ void
 CPostEffects::Radiosity_shader(int intensityLimit, int filterPasses, int renderPasses, int intensity)
 {
 	static RwRaster *workBuffer;
+	// v9.46: effective (post-fade) radiosity add on a slow heartbeat
+	if((sfxRadSeq & 15) == 0 && sfxLogRadRun < 200){
+		sfxLogRadRun++;
+		sfxLogLine("RADRUN seq=%u lim=%d inten=%d passes=%d/%d\n",
+			sfxRadSeq, intensityLimit, intensity, filterPasses, renderPasses);
+	}
 	if(workBuffer)
 		if(workBuffer->width != pRasterFrontBuffer->width ||
 		   workBuffer->height != pRasterFrontBuffer->height ||
@@ -809,8 +816,13 @@ CPostEffects::Radiosity(int intensityLimit, int filterPasses, int renderPasses, 
 		{
 			static int sLim = -1, sInt = -1;
 			if(sLim < 0){
-				sLim = intensityLimit;
-				sInt = intensity;
+				// v9.46: the first call after the vanilla gate opens used
+				// to draw the glow at full strength instantly - the RAD
+				// start pop (v9.44 log: RAD@f=531 + SNAP@f=550; v9.45
+				// log: RAD@f=371 + SNAP@f=373). Start the fade from zero
+				// so the glow fades in over ~0.3 s instead of popping.
+				sLim = 0;
+				sInt = 0;
 			}
 			int dl = intensityLimit - sLim;
 			int di = intensity - sInt;
@@ -1918,7 +1930,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.45) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.46) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3617,6 +3629,76 @@ RenderScale_DeferredStretch(void)
 	sfxW2DNoClear = 0;
 }
 
+// v9.46: FINAL-image delta probe. The existing probes miss the snap the
+// player sees: sfxProbeResolveBB samples right after the fp16 resolve
+// (BEFORE the colour filter and radiosity glow draw) and sfxProbeBackBuffer
+// only prints on white/black/beige verdict changes - a warm<->green tint
+// flip never changes the verdict, so it stayed silent. This twin runs at
+// the very end of DrawFinalEffects, averages the same 16x9 colour grid as
+// the RB probe and logs every jump over the snap threshold together with
+// the camera angles and the current filter colour - the first numeric
+// capture of the user-visible snap.
+static int sfxProbeFAvR = -1, sfxProbeFAvG, sfxProbeFAvB;
+static int sfxProbeFSeq;
+static void
+sfxProbeFinalBB(void)
+{
+	IDirect3DDevice9 *dev = d3d9device;
+	IDirect3DSurface9 *bb = nil, *sys = nil;
+	D3DSURFACE_DESC d;
+	D3DLOCKED_RECT lr;
+	unsigned int sc;
+	int sr = 0, sg = 0, sb = 0, si;
+	int avR, avG, avB, dR, dG, dB, mag, avP, avH;
+	if(dev == nil)
+		return;
+	if(((++sfxProbeFSeq) & 3) != 1)
+		return;
+	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || bb == nil)
+		return;
+	if(bb->GetDesc(&d) != D3D_OK ||
+	   dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+	                                    D3DPOOL_SYSTEMMEM, &sys, nil) != D3D_OK ||
+	   dev->GetRenderTargetData(bb, sys) != D3D_OK ||
+	   sys->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK){
+		if(sys) sys->Release();
+		if(bb) bb->Release();
+		return;
+	}
+	for(si = 0; si < 144; si++){
+		sc = *(unsigned int*)((unsigned char*)lr.pBits
+			+ (d.Height/18 + (si/16)*(d.Height/9))*lr.Pitch
+			+ (d.Width/32 + (si%16)*(d.Width/16))*4);
+		sr += (int)((sc >> 16) & 0xFF);
+		sg += (int)((sc >> 8) & 0xFF);
+		sb += (int)(sc & 0xFF);
+	}
+	sys->UnlockRect();
+	sys->Release();
+	bb->Release();
+	avR = sr/144; avG = sg/144; avB = sb/144;
+	if(sfxProbeFAvR >= 0 && sfxProbeGame){
+		dR = avR - sfxProbeFAvR;
+		dG = avG - sfxProbeFAvG;
+		dB = avB - sfxProbeFAvB;
+		mag = (dR < 0 ? -dR : dR) + (dG < 0 ? -dG : dG) + (dB < 0 ? -dB : dB);
+		sfxCamAngles(&avP, &avH);
+		if(mag > 12)
+			sfxLogLine("SNAPF f=%u d=%d,%d,%d av=%d,%d,%d p=%d h=%d c2=%d,%d,%d,%d\n",
+				sfxFrameNo, dR, dG, dB, avR, avG, avB, avP, avH,
+				vcsblurrgb.red, vcsblurrgb.green, vcsblurrgb.blue,
+				vcsblurrgb.alpha);
+		else if((sfxProbeFSeq & 31) == 1)
+			sfxLogLine("FB f=%u av=%d,%d,%d p=%d h=%d c2=%d,%d,%d,%d\n",
+				sfxFrameNo, avR, avG, avB, avP, avH,
+				vcsblurrgb.red, vcsblurrgb.green, vcsblurrgb.blue,
+				vcsblurrgb.alpha);
+	}
+	sfxProbeFAvR = avR;
+	sfxProbeFAvG = avG;
+	sfxProbeFAvB = avB;
+}
+
 void
 CPostEffects::DrawFinalEffects(void)
 {
@@ -3857,6 +3939,8 @@ CPostEffects::DrawFinalEffects(void)
 	}
 	// v9.30m: content of the FINAL composite output - the truth probe.
 	sfxProbeBackBuffer();
+	// v9.46: final-image colour-average + user-visible snap capture
+	sfxProbeFinalBB();
 
 	RwD3D9SetTexture(nil, 1);
 	RwD3D9SetTexture(nil, 2);
