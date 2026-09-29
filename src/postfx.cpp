@@ -652,6 +652,13 @@ static int sfxLogRad;
 static int sfxLogRad2;
 static int sfxLogDK;
 static int sfxLogRadRun;
+// v9.47: live stage toggles (F7 composite / F8 colour filter / F9
+// radiosity). The user reproduces the snap and toggles ONE stage at a
+// time; whichever toggle removes or restores the green-tint state
+// localizes the flip to that stage. Pure pointers/state, no game bytes.
+static int sfxKillComposite;
+static int sfxKillFilter;
+static int sfxKillRad;
 // v9.45: call-presence counters - the DeferredStretch per-frame section
 // compares them against last frame to detect the vanilla gate SKIPPING a
 // call (a binary skip of the filter/glow draw = the suspected ON/OFF snap)
@@ -664,6 +671,9 @@ void *blurPS, *radiosityPS;
 void
 CPostEffects::Radiosity_shader(int intensityLimit, int filterPasses, int renderPasses, int intensity)
 {
+	// v9.47: live toggle - skip the glow draw entirely while set
+	if(sfxKillRad)
+		return;
 	static RwRaster *workBuffer;
 	// v9.46: effective (post-fade) radiosity add on a slow heartbeat
 	if((sfxRadSeq & 15) == 0 && sfxLogRadRun < 200){
@@ -1459,6 +1469,13 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 		}
 	}
 
+	// v9.47: live toggle - skip the filter draw entirely while set
+	if(sfxKillFilter){
+		if((sfxCFSeq & 63) == 0)
+			sfxLogLine("CF KILLED seq=%u\n", sfxCFSeq);
+		return;
+	}
+
 	RwRGBA rgb1pc = rgb1;
 	RwRGBA rgb2pc = rgb2;
 
@@ -1930,7 +1947,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.46) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.47) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3734,6 +3751,42 @@ CPostEffects::DrawFinalEffects(void)
 	bool doGrain = config->ps2Grain != 0;
 	float grainStrength = config->ps2GrainStrength;
 	bool doAutoExp = config->doAutoExposure != 0;
+
+	// v9.47: live stage toggles - F7 = composite (bloom/tonemap/exposure/
+	// AE/vignette/CA), F8 = colour filter, F9 = radiosity. Edge-detected;
+	// every press is logged with the frame number so the log brackets
+	// exactly when each stage was live.
+	{
+		static bool k7, k8, k9;
+		if(GetAsyncKeyState(0x76) & 0x8000){
+			if(!k7){
+				k7 = true;
+				sfxKillComposite = !sfxKillComposite;
+				sfxLogLine("TOG f=%u compositeBypass=%d\n", sfxFrameNo, sfxKillComposite);
+			}
+		}else
+			k7 = false;
+		if(GetAsyncKeyState(0x77) & 0x8000){
+			if(!k8){
+				k8 = true;
+				sfxKillFilter = !sfxKillFilter;
+				sfxLogLine("TOG f=%u filterBypass=%d\n", sfxFrameNo, sfxKillFilter);
+			}
+		}else
+			k8 = false;
+		if(GetAsyncKeyState(0x78) & 0x8000){
+			if(!k9){
+				k9 = true;
+				sfxKillRad = !sfxKillRad;
+				sfxLogLine("TOG f=%u radiosityBypass=%d\n", sfxFrameNo, sfxKillRad);
+			}
+		}else
+			k9 = false;
+	}
+	// composite bypass: the whole mod post chain does nothing this frame
+	// (SNAPF/FB pause with it - they live at the end of this function)
+	if(sfxKillComposite)
+		return;
 
 	// renderScale: the frame was already stretched to full size by the
 	// deferred stretch (RenderScale_DeferredStretch, before the game
