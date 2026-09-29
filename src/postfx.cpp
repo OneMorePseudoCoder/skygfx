@@ -2038,7 +2038,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.54) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.55) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3443,6 +3443,15 @@ sfxHDRresolve(RwRaster *camR)
 	struct HDRVtx { float x, y, z, rhw, u, v; } v[4];
 	IDirect3DSurface9 *bb = nil, *ds = nil;
 	DWORD oldZen = 0, oldCull = 0, oldBlend = 0;
+	// v9.55: the three SILENT CULLERS. The resolve already neutralizes
+	// z/cull/blend/PS/TSS, but a leftover scissor rect, alpha test or
+	// stencil state culled the quad without any error - the log line
+	// still printed, the back buffer never received the scene, and the
+	// whole post chain then accumulated on the stale frame (green/
+	// white/black states, HUD stuck in fp16, pause freezing the stale
+	// frame). Which states are stale depends on what the camera sees -
+	// hence the pitch correlation. Save them, log when armed, kill.
+	DWORD oldSc = 0, oldAt = 0, oldSt = 0;
 	HRESULT hr;
 	float uw, vh;
 	int i;
@@ -3459,6 +3468,17 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
 	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
 	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
+	d3d9device->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldSc);
+	d3d9device->GetRenderState(D3DRS_ALPHATESTENABLE, &oldAt);
+	d3d9device->GetRenderState(D3DRS_STENCILENABLE, &oldSt);
+	{
+		static int sfxLogClip;
+		if((oldSc || oldAt || oldSt) && sfxLogClip < 12){
+			sfxLogClip++;
+			sfxLogLine("H2 clip states: scissor=%u atest=%u stencil=%u\n",
+				oldSc, oldAt, oldSt);
+		}
+	}
 	// full viewport first - the quad is placed in full-raster coordinates
 	struct SfxD3DViewport fullvp = {0, 0, (unsigned int)camR->width, (unsigned int)camR->height, 0.0f, 1.0f};
 	if(d3dSetViewportOrig)
@@ -3485,6 +3505,9 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->SetRenderState(D3DRS_ZENABLE, FALSE);
 	d3d9device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
 	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
 	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 	d3d9device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
@@ -3574,6 +3597,9 @@ sfxHDRresolve(RwRaster *camR)
 	d3d9device->SetRenderState(D3DRS_ZENABLE, oldZen);
 	d3d9device->SetRenderState(D3DRS_CULLMODE, oldCull);
 	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, oldBlend);
+	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, oldSc);
+	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, oldAt);
+	d3d9device->SetRenderState(D3DRS_STENCILENABLE, oldSt);
 	sfxHDRon = 0;
 	RwCameraBeginUpdate(Scene.camera);
 	if(sfxLogR++ < 2000)
