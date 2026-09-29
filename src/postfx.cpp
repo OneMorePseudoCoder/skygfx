@@ -198,20 +198,29 @@ sfxBBRegister(RwRaster *camR)
 	sfxBBRaster = camR;
 }
 
-// v9.36e: the 9.36d run failed EVERY call ("U2 live fill FAILED" from
-// the first resolve on): RwRasterPushContext defers the render-target
-// commit, so GetRenderTarget still reported the old target (the back
-// buffer) and the self-copy guard rejected everything - full stock
-// behaviour, the old symptoms back. This version copies through the
-// paths the game itself uses every frame: switch the camera raster to
-// the front buffer (the colour filter's own RwCameraSetRaster pattern)
-// and draw the camera raster as a full-screen textured quad with the
-// game's DrawQuad (the same textured-quad class the filter and the
-// deferred stretch use). Current pixels, RW-native, no device state.
+// v9.36e: the 9.36d run failed EVERY call - PushContext defers the
+// render-target commit, so the 9.36d copy probed GetRenderTarget and
+// always saw the back buffer, and the self-copy guard rejected all
+// (0 "U2 live fb" lines). v9.36e switched the camera raster instead -
+// the fill itself ran, but the bare DrawQuad call white-screened the
+// whole game (screenshot 85): CPostEffects::DrawQuad does NOT set up
+// the D3D vertex declaration, the quad UVs or the blend state on its
+// own. EVERY other caller in this file wraps it in
+// ImmediateModeRenderStatesStore/Set and resets the UVs afterwards;
+// the bare call drew with whatever the fp16 pipeline had left,
+// poisoned the front buffer with garbage and every composite came
+// out white - in-game AND in the pause menu (the filter keeps
+// compositing there). v9.36f keeps the live camera-raster source but
+// copies inside the vanilla write bracket (RwRasterPushContext - the
+// same pause-safe one the stock copy uses, with NO 9.36d
+// GetRenderTarget probe) and draws the camera raster as one
+// full-screen quad using the exact state pattern of the proven
+// callers (default UVs, straight SRCALPHA/INVSRCALPHA copy, vertex
+// colour 255). RW-native, nothing left behind.
 static int
 sfxLiveCopyFB(void)
 {
-	RwRaster *camR, *fb, *r;
+	RwRaster *camR, *fb;
 	if(Scene.camera == nil)
 		return 0;
 	fb = CPostEffects::pRasterFrontBuffer;
@@ -223,21 +232,24 @@ sfxLiveCopyFB(void)
 		// copy would copy the raster onto itself; skip, nothing to do
 		return 1;
 	}
-	RwCameraEndUpdate(Scene.camera);
-	RwCameraSetRaster(Scene.camera, fb);
-	RwCameraBeginUpdate(Scene.camera);
+	RwRasterPushContext(fb);
+	CPostEffects::ImmediateModeRenderStatesStore();
+	CPostEffects::ImmediateModeRenderStatesSet();
+	CPostEffects::DrawQuadSetDefaultUVs();
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
+	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
+	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
 	CPostEffects::DrawQuad(0.0f, 0.0f, (float)fb->width, (float)fb->height,
 		255, 255, 255, 255, camR);
-	RwCameraEndUpdate(Scene.camera);
-	RwCameraSetRaster(Scene.camera, camR);
-	RwCameraBeginUpdate(Scene.camera);
+	CPostEffects::ImmediateModeRenderStatesReStore();
+	RwRasterPopContext();
 	return 1;
 }
 
 // v9.36: SEH wrapper. Copies the live back buffer content into the
-// front buffer through sfxLiveCopyFB (camera-switch + DrawQuad). Any
-// fault falls back to the stock copy and disables the live path.
-static int
+// front buffer through sfxLiveCopyFB (PushContext bracket + Im2D
+// quad). Any fault falls back to the stock copy and disables the
+// live path.
 sfxHDRfillLive(void)
 {
 	int ok = 1;
@@ -283,11 +295,11 @@ CPostEffects::UpdateFrontBuffer(void)
 	// filled AFTER the filter had already read last frame's content -
 	// a same-frame feedback loop that accumulated into the blurred
 	// warm wash (screenshot 76), the white-out peaks and the warm
-	// snap. v9.36e: the copy is RW-native - the camera raster is
-	// switched to the front buffer and the camera raster drawn as one
-	// textured quad (see sfxLiveCopyFB) - the current back buffer
-	// every time, so the every-refresh call matches the vanilla
-	// semantics exactly.
+	// snap. v9.36f: the copy runs in the vanilla write bracket
+	// (RwRasterPushContext) and draws the camera raster as one
+	// full-screen quad with the proven caller state pattern (see
+	// sfxLiveCopyFB) - the current back buffer every time, so the
+	// every-refresh call matches the vanilla semantics exactly.
 	if(sfxHDRready && sfxBBRaster != nil
 		&& RwCameraGetRaster(Scene.camera) == sfxBBRaster){
 		if(sfxHDRfillLive())
@@ -1824,7 +1836,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36e) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36f) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
