@@ -187,6 +187,10 @@ static RwRaster *sfxBBRaster;		// the swap-chain-backed camera raster
 static RwRaster *sfxLiveRaster;
 static int sfxLiveW, sfxLiveH;
 static int sfxLogLive;
+// v9.51: cached staging surface for the live fill (v9.50 created and
+// released one three times per frame - most of the added FPS drop)
+static IDirect3DSurface9 *sfxSysSurf;
+static int sfxSysW, sfxSysH;
 // v9.50b: forward declaration - UpdateFrontBuffer logs before the
 // declaration block further down (CI C3861)
 static void sfxLogLine(const char *fmt, ...);
@@ -274,7 +278,18 @@ CPostEffects::UpdateFrontBuffer(void)
 		  fprintf(sfxLog, "UF raster=%08x %dx%dx%d n=%d\n",
 			  (unsigned int)(void*)r, r->width, r->height, r->depth, n);
 	}
-	RwCameraEndUpdate(Scene.camera);
+	// v9.51: THE PAUSE-BLACK ROOT. v9.50 opened every copy with
+	// RwCameraEndUpdate and closed it with RwCameraBeginUpdate - but
+	// BeginUpdate CLEARS the camera raster, and here that raster is
+	// the presented back buffer. UpdateFrontBuffer runs three times
+	// per frame and the last call sits AFTER the composite, so a
+	// freshly cleared (black/white) back buffer could reach the
+	// screen: the intermittent black bursts (v9.50b log f=575,
+	// recovered by the next frame's resolve) and the persistent
+	// black/white pause background (while paused nothing refills the
+	// cleared buffer). The live fill below no longer touches the
+	// camera context at all on the back-buffer path - GetRenderTargetData
+	// is device-level and the blit only pushes/pops a raster context.
 	// v9.50: when the camera raster is the swap-chain back buffer
 	// (hdrBuffer=1), the stock copy below reads RW's stale system copy
 	// of it - an ancient frame. In the pause menu that is exactly the
@@ -285,17 +300,32 @@ CPostEffects::UpdateFrontBuffer(void)
 	// passes (camera on workBuffer) keep the stock path; any fault in
 	// the readback falls back to the stock copy (v9.33 pattern).
 	{
-		IDirect3DSurface9 *bb = nil, *sys = nil;
+		IDirect3DSurface9 *bb = nil;
 		D3DSURFACE_DESC d;
 		D3DLOCKED_RECT lr;
-		int done = 0;
+		int done = 0, locked = 0;
 		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
 		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil &&
-		   bb->GetDesc(&d) == D3D_OK &&
-		   d3d9device->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
-		                                           D3DPOOL_SYSTEMMEM, &sys, nil) == D3D_OK &&
-		   d3d9device->GetRenderTargetData(bb, sys) == D3D_OK &&
-		   sys->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
+		   bb->GetDesc(&d) == D3D_OK){
+			// v9.51: the staging surface is cached and reused; the
+			// readback itself still runs on every call so the fill
+			// semantics stay vanilla (post-filter for radiosity,
+			// post-effect for the composite)
+			if(sfxSysSurf == nil ||
+			   sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
+				if(sfxSysSurf)
+					sfxSysSurf->Release();
+				sfxSysSurf = nil;
+				if(d3d9device->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+				                                           D3DPOOL_SYSTEMMEM, &sfxSysSurf, nil) == D3D_OK){
+					sfxSysW = d.Width;
+					sfxSysH = d.Height;
+				}
+			}
+			if(sfxSysSurf != nil &&
+			   d3d9device->GetRenderTargetData(bb, sfxSysSurf) == D3D_OK &&
+			   sfxSysSurf->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
+				locked = 1;
 			if(sfxLiveRaster == nil ||
 			   sfxLiveW != (int)d.Width || sfxLiveH != (int)d.Height){
 				if(sfxLiveRaster)
@@ -325,19 +355,23 @@ CPostEffects::UpdateFrontBuffer(void)
 				}
 			}
 		}
-		if(sys){
-			sys->UnlockRect();
-			sys->Release();
 		}
+		if(locked && sfxSysSurf)
+			sfxSysSurf->UnlockRect();
 		if(bb)
 			bb->Release();
 		if(!done){
+			// stock copy path (camera on a work raster, or readback
+			// fault): the vanilla EndUpdate/BeginUpdate pair is safe
+			// here because BeginUpdate clears the WORK raster, never
+			// the presented back buffer
+			RwCameraEndUpdate(Scene.camera);
 			RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
 			RwRasterRenderFast(RwCameraGetRaster(Scene.camera), 0, 0);
 			RwRasterPopContext();
+			RwCameraBeginUpdate(Scene.camera);
 		}
 	}
-	RwCameraBeginUpdate(Scene.camera);
 }
 
 RwRaster *vcs_radiosity_target1, *vcs_radiosity_target2;
@@ -722,7 +756,6 @@ static int sfxLogDK;
 static int sfxLogRadRun;
 // v9.48: fresh-copy bookkeeping for the filter texture (see
 // ColourFilter_switch) - its log line budget
-static int sfxLogFresh;
 // v9.45: call-presence counters - the DeferredStretch per-frame section
 // compares them against last frame to detect the vanilla gate SKIPPING a
 // call (a binary skip of the filter/glow draw = the suspected ON/OFF snap)
@@ -903,7 +936,7 @@ CPostEffects::Radiosity(int intensityLimit, int filterPasses, int renderPasses, 
 			if(sLim > 255) sLim = 255;
 			if(sInt < 0) sInt = 0;
 			if(sInt > 255) sInt = 255;
-			if(sfxLogRad2 < 48 &&
+			if(sfxLogRad2 < 600 &&
 			   ((di < -8 || di > 8) || (dl < -8 || dl > 8))){
 				sfxLogRad2++;
 				sfxLogLine("RADSMOOTH dl=%d di=%d lim=%d->%d inten=%d->%d\n",
@@ -1478,30 +1511,6 @@ CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 {
 	sfxCFSeq++;
 
-	// v9.50: RT0 guard. With hdrBuffer=1 the fp16 pipeline binds its own
-	// render target for the scene; the resolve normally restores the back
-	// buffer. If a resolve hiccup leaves RT0 on the fp16 surface, this
-	// filter - and the HUD the game draws right after - land on a surface
-	// that is never presented: the reported "filter OFF, no HUD/map" state
-	// (the user-facing ON state, green-yellow at night, is the correct
-	// one). Re-bind RT0 to the back buffer before drawing so the whole
-	// post chain always lands on the presented frame.
-	{
-		IDirect3DSurface9 *cur = nil, *bbs = nil;
-		if(d3d9device->GetRenderTarget(0, &cur) == D3D_OK &&
-		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bbs) == D3D_OK &&
-		   cur != nil && bbs != nil && cur != bbs){
-			d3d9device->SetRenderTarget(0, bbs);
-			if(sfxLogFresh < 40){
-				sfxLogFresh++;
-				sfxLogLine("RTFIX f seq=%u pf=%d\n", sfxCFSeq, sfxProbeFrame);
-			}
-		}
-		if(cur)
-			cur->Release();
-		if(bbs)
-			bbs->Release();
-	}
 
 	RwRGBA rgb1pc = rgb1;
 	RwRGBA rgb2pc = rgb2;
@@ -1974,7 +1983,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.50) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.51) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2022,7 +2031,6 @@ static int sfxLogCap;	// v9.30g: sky-call log cap (sfxLogS is taken, C2086)
 static unsigned int sfxFrameNo;
 static int sfxLogXF;
 static int sfxLogDFE;
-static int sfxLogRT2;
 static int sfxLogVP;
 static int sfxLogCL;
 // (sfxLogCF moved to the top of ColourFilter_switch's section in v9.30j2 -
@@ -3685,6 +3693,7 @@ RenderScale_DeferredStretch(void)
 // capture of the user-visible snap.
 static int sfxProbeFAvR = -1, sfxProbeFAvG, sfxProbeFAvB;
 static int sfxProbeFSeq;
+static int sfxLogH16S;
 static void
 sfxProbeFinalBB(void)
 {
@@ -3728,12 +3737,47 @@ sfxProbeFinalBB(void)
 		dB = avB - sfxProbeFAvB;
 		mag = (dR < 0 ? -dR : dR) + (dG < 0 ? -dG : dG) + (dB < 0 ? -dB : dB);
 		sfxCamAngles(&avP, &avH);
-		if(mag > 12)
+		if(mag > 12){
 			sfxLogLine("SNAPF f=%u d=%d,%d,%d av=%d,%d,%d p=%d h=%d c2=%d,%d,%d,%d\n",
 				sfxFrameNo, dR, dG, dB, avR, avG, avB, avP, avH,
 				vcsblurrgb.red, vcsblurrgb.green, vcsblurrgb.blue,
 				vcsblurrgb.alpha);
-		else if((sfxProbeFSeq & 31) == 1)
+			// v9.51: bifurcation probe - read the fp16 scene surface at
+			// the SAME moment as a visible jump. If the jump is already
+			// in the fp16 content, the scene/filter chain produces it;
+			// if fp16 is normal while the back buffer jumped, the fault
+			// is in the resolve/composite half. Budgeted.
+			{
+				IDirect3DSurface9 *hsrc = (IDirect3DSurface9*)sfxHDRsurf, *hsys = nil;
+				D3DSURFACE_DESC hd;
+				D3DLOCKED_RECT hlr;
+				if(sfxLogH16S < 150 &&
+				   hsrc != nil &&
+				   hsrc->GetDesc(&hd) == D3D_OK &&
+				   dev->CreateOffscreenPlainSurface(hd.Width, hd.Height, hd.Format,
+				                                    D3DPOOL_SYSTEMMEM, &hsys, nil) == D3D_OK &&
+				   dev->GetRenderTargetData(hsrc, hsys) == D3D_OK &&
+				   hsys->LockRect(&hlr, nil, D3DLOCK_READONLY) == D3D_OK){
+					int hmn = 32767, hmx = -32768, hi;
+					long hsum = 0;
+					for(hi = 0; hi < 32; hi++){
+						unsigned int hc = *(unsigned int*)((unsigned char*)hlr.pBits
+							+ (hd.Height/16 + (hi>>2)*(hd.Height/8))*hlr.Pitch
+							+ (hd.Width/16 + (hi&3)*(hd.Width/8))*8);
+						int hv = (int)(unsigned short)(hc & 0xFFFF);
+						hsum += hv;
+						if(hv > hmx) hmx = hv;
+						if(hv < hmn) hmn = hv;
+					}
+					hsys->UnlockRect();
+					sfxLogH16S++;
+					sfxLogLine("H16S f=%u fp16mn=%d fp16mx=%d fp16av=%d\n",
+						sfxFrameNo, hmn, hmx, (int)(hsum/32));
+				}
+				if(hsys)
+					hsys->Release();
+			}
+		}else if((sfxProbeFSeq & 3) == 2)
 			sfxLogLine("FB f=%u av=%d,%d,%d p=%d h=%d c2=%d,%d,%d,%d\n",
 				sfxFrameNo, avR, avG, avB, avP, avH,
 				vcsblurrgb.red, vcsblurrgb.green, vcsblurrgb.blue,
@@ -3754,24 +3798,6 @@ CPostEffects::DrawFinalEffects(void)
 	// deferred stretch here (the window is still open at this point)
 	if(sfxStretchPending)
 		RenderScale_DeferredStretch();
-	// v9.50: same RT0 guard as the filter - the composite must land on
-	// the presented back buffer too
-	{
-		IDirect3DSurface9 *cur = nil, *bbs = nil;
-		if(d3d9device->GetRenderTarget(0, &cur) == D3D_OK &&
-		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bbs) == D3D_OK &&
-		   cur != nil && bbs != nil && cur != bbs){
-			d3d9device->SetRenderTarget(0, bbs);
-			if(sfxLogRT2 < 40){
-				sfxLogRT2++;
-				sfxLogLine("RTFIX dfe n=%d pf=%d\n", sfxLogRT2, sfxProbeFrame);
-			}
-		}
-		if(cur)
-			cur->Release();
-		if(bbs)
-			bbs->Release();
-	}
 	if(sfxScaleActive){
 		sfxScaleActive = 0;
 		if(sfxVpScaled && sfxVpFull.width != 0 && d3dSetViewportOrig){
