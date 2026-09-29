@@ -1784,7 +1784,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.40) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.41) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2643,6 +2643,7 @@ static unsigned int sfxProbeRBHash;
 static int sfxProbeRBSame;
 static int sfxProbeRBFail;
 static void
+static int sfxProbeWhiteDiag;
 sfxProbeResolveBB(void)
 {
 	IDirect3DDevice9 *dev = d3d9device;
@@ -2697,6 +2698,45 @@ sfxProbeResolveBB(void)
 	else					v = 0;
 	vs = v == 1 ? " WHITE" : v == 2 ? " BLACK" : v == 3 ? " BEIGE" : v == 4 ? " YELLOW" : "";
 	if(s != 0 && s == sfxProbeRBHash){
+	// v9.41: at a white resolve output, snapshot the FP16 content and the
+	// live stage-0 state. fp16 values are read as the red half float;
+	// 15360 == 1.0, so mn>15360 proves the source texel data itself was
+	// over-bright, while normal fp16 indicts the state path. Throttled
+	// hard - this is an episode-only readback.
+	if(v == 1 && sfxProbeWhiteDiag < 4){
+		sfxProbeWhiteDiag++;
+		IDirect3DSurface9 *hsrc = (IDirect3DSurface9*)sfxHDRsurf, *hsys = nil;
+		D3DSURFACE_DESC hd;
+		D3DLOCKED_RECT hlr;
+		DWORD hcOp = 0, hArg1 = 0, hArg2 = 0, hS1 = 0;
+		d3d9device->GetTextureStageState(0, D3DTSS_COLOROP, &hcOp);
+		d3d9device->GetTextureStageState(0, D3DTSS_COLORARG1, &hArg1);
+		d3d9device->GetTextureStageState(0, D3DTSS_COLORARG2, &hArg2);
+		d3d9device->GetTextureStageState(1, D3DTSS_COLOROP, &hS1);
+		if(hsrc != nil && hsrc->GetDesc(&hd) == D3D_OK &&
+		   d3d9device->CreateOffscreenPlainSurface(hd.Width, hd.Height, hd.Format,
+		                                    D3DPOOL_SYSTEMMEM, &hsys, nil) == D3D_OK &&
+		   d3d9device->GetRenderTargetData(hsrc, hsys) == D3D_OK &&
+		   hsys->LockRect(&hlr, nil, D3DLOCK_READONLY) == D3D_OK){
+			int hm = 32767, hx = -32768, hsum = 0, hi;
+			for(hi = 0; hi < 32; hi++){
+				unsigned int hc = *(unsigned int*)((unsigned char*)hlr.pBits
+					+ (hd.Height/16 + (hi>>2)*(hd.Height/8))*hlr.Pitch
+					+ (hd.Width/16 + (hi&3)*(hd.Width/8))*8);
+				int hr = (int)(unsigned short)(hc & 0xFFFF);
+				hsum += hr;
+				if(hr > hx) hx = hr;
+				if(hr < hm) hm = hr;
+			}
+			hsys->UnlockRect();
+			sfxLogLine("WHITE diag f=%u: fp16 mn=%d mx=%d av=%d (1.0=15360) | TSS cop=%u arg1=%u arg2=%u s1cop=%u\n",
+				sfxFrameNo, hm, hx, hsum/32, hcOp, hArg1, hArg2, hS1);
+		}else
+			sfxLogLine("WHITE diag f=%u: fp16 readback failed | TSS cop=%u arg1=%u arg2=%u s1cop=%u\n",
+				sfxFrameNo, hcOp, hArg1, hArg2, hS1);
+		if(hsys)
+			hsys->Release();
+	}
 		sfxProbeRBSame++;
 		if((sfxProbeRBSame & 3) == 1)
 			sfxProbeOut("RB", s, mn, mx, sum/64, p0, pm, vs, " SAME");
@@ -3174,7 +3214,44 @@ sfxHDRresolve(RwRaster *camR)
 		v[i].z = 0.0f;
 		v[i].rhw = 1.0f;
 	}
-	d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(struct HDRVtx));
+	// v9.41: sanitize fixed-function texture stage state around the
+	// resolve quad. Vanilla RwIm2D draws (sky gradient, world2d overlays,
+	// marker coronas) reprogram stage-0 color args for untextured draws;
+	// this quad's FVF has no DIFFUSE element, so a leftover argument
+	// select (DIFFUSE/TFACTOR) paints constant opaque white - matching
+	// the deterministic full-frame white episodes. Which Im2D draws ran
+	// last depends on what the camera sees - hence the pitch correlation.
+	{
+		DWORD ocop, oarg1, oarg2, oaop, oaarg1, oaarg2, os1;
+		d3d9device->GetTextureStageState(0, D3DTSS_COLOROP, &ocop);
+		d3d9device->GetTextureStageState(0, D3DTSS_COLORARG1, &oarg1);
+		d3d9device->GetTextureStageState(0, D3DTSS_COLORARG2, &oarg2);
+		d3d9device->GetTextureStageState(0, D3DTSS_ALPHAOP, &oaop);
+		d3d9device->GetTextureStageState(0, D3DTSS_ALPHAARG1, &oaarg1);
+		d3d9device->GetTextureStageState(0, D3DTSS_ALPHAARG2, &oaarg2);
+		d3d9device->GetTextureStageState(1, D3DTSS_COLOROP, &os1);
+		if(sfxLogPS < 6 && (ocop != D3DTOP_MODULATE || oarg1 != D3DTA_TEXTURE)){
+			sfxLogPS++;
+			sfxLogLine("H2 stray TSS before resolve: cop=%u arg1=%u arg2=%u aop=%u s1cop=%u - sanitized\n",
+				ocop, oarg1, oarg2, oaop, os1);
+		}
+		d3d9device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+		d3d9device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+		d3d9device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+		d3d9device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+		d3d9device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+		d3d9device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+		d3d9device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+		d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(struct HDRVtx));
+		// restore exactly what was there - RW keeps its own state cache
+		d3d9device->SetTextureStageState(0, D3DTSS_COLOROP, ocop);
+		d3d9device->SetTextureStageState(0, D3DTSS_COLORARG1, oarg1);
+		d3d9device->SetTextureStageState(0, D3DTSS_COLORARG2, oarg2);
+		d3d9device->SetTextureStageState(0, D3DTSS_ALPHAOP, oaop);
+		d3d9device->SetTextureStageState(0, D3DTSS_ALPHAARG1, oaarg1);
+		d3d9device->SetTextureStageState(0, D3DTSS_ALPHAARG2, oaarg2);
+		d3d9device->SetTextureStageState(1, D3DTSS_COLOROP, os1);
+	}
 	// v9.30o: did the quad actually land? Content of the back buffer
 	// right now - pairs with the end-of-composite BB probe of this frame.
 	sfxProbeResolveBB();
