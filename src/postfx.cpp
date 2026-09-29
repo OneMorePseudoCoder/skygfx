@@ -228,32 +228,114 @@ sfxBBRegister(RwRaster *camR)
 // snap (radiosity smearing the zoomed composite) and the
 // angle-triggered white flashes. The quad now covers the camera
 // raster's own rect - 1:1, exactly where the stock copy puts it.
+// v9.38: the e/f/g quad family is DISPROVEN - RwRasterPushContext on
+// the colour filter's front-buffer raster cannot make it a D3D render
+// target (it is a texture-only raster; vanilla only ever writes it
+// through the CPU RenderFast path), so every quad in that family was
+// really drawn onto whatever target was bound at the moment - the back
+// buffer or a chain raster. That one mistake produced every artifact of
+// the 9.36e/f/g runs: the pitch white flashes (looking up/down moves
+// the fill moment inside the chain, so the stray quad landed mid
+// filter/radiosity pass), the blur snap and the dim. This version
+// returns to the v9.36b write path - the one that ran two full
+// sessions with ZERO rendering artifacts:
+//   GetRenderTargetData into a SYSTEMMEM copy (the legal one-way
+//   readback), upload into our OWN CAMERATEXTURE raster (lock/unlock,
+//   the proven dither pattern), then the VANILLA write:
+//   RwRasterPushContext(fb) + RwRasterRenderFast(liveRaster, 0, 0) -
+//   a CPU blit that lands the image 1:1 in the padded front buffer's
+//   top-left corner, exactly where the stock copy and the filter UVs
+//   expect it. The once-per-frame gate stays (first refresh after the
+//   resolve). The known remaining issue - weak/stock-like warm - is
+//   the queued radiosity warm-constancy tuning, now on a stable base.
+static IDirect3DSurface9 *sfxSysCopy;
+static int sfxSysW, sfxSysH;
+static RwRaster *sfxLiveRaster;
+static int sfxLiveW, sfxLiveH;
+static int sfxLogUF;				// bounded log: upload failures
+
+static void
+sfxLiveUpload(void)
+{
+	IDirect3DDevice9 *dev = d3d9device;
+	IDirect3DSurface9 *bb = nil;
+	D3DSURFACE_DESC d;
+	D3DLOCKED_RECT lr;
+	RwUInt8 *dst;
+	int y, cw, ch;
+	if(dev == nil)
+		return;
+	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
+		|| bb == nil)
+		return;
+	if(bb->GetDesc(&d) != D3D_OK){
+		bb->Release();
+		return;
+	}
+	if(sfxSysCopy == nil || sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
+		if(sfxSysCopy)
+			sfxSysCopy->Release();
+		sfxSysCopy = nil;
+		if(dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+			D3DPOOL_SYSTEMMEM, &sfxSysCopy, nil) != D3D_OK){
+			sfxSysCopy = nil;
+			bb->Release();
+			return;
+		}
+		sfxSysW = (int)d.Width;
+		sfxSysH = (int)d.Height;
+	}
+	if(dev->GetRenderTargetData(bb, sfxSysCopy) != D3D_OK){
+		bb->Release();
+		return;
+	}
+	bb->Release();
+	if(sfxLiveRaster == nil || sfxLiveW != sfxSysW || sfxLiveH != sfxSysH){
+		if(sfxLiveRaster)
+			RwRasterDestroy(sfxLiveRaster);
+		sfxLiveRaster = nil;
+		sfxLiveRaster = RwRasterCreate(sfxSysW, sfxSysH, 32,
+			rwRASTERTYPECAMERATEXTURE);
+		if(sfxLiveRaster == nil)
+			return;
+		sfxLiveW = sfxSysW;
+		sfxLiveH = sfxSysH;
+	}
+	if(sfxSysCopy->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK)
+		return;
+	dst = (RwUInt8*)RwRasterLock(sfxLiveRaster, 0, 1);
+	if(dst == nil){
+		sfxSysCopy->UnlockRect();
+		return;
+	}
+	cw = sfxSysW;
+	ch = sfxSysH;
+	for(y = 0; y < ch; y++)
+		memcpy(dst + y*cw*4, (RwUInt8*)lr.pBits + y*lr.Pitch, cw*4);
+	RwRasterUnlock(sfxLiveRaster);
+	sfxSysCopy->UnlockRect();
+}
+
 static int
 sfxLiveCopyFB(void)
 {
-	RwRaster *camR, *fb;
-	if(Scene.camera == nil)
+	RwRaster *fb;
+	if(d3d9device == nil)
 		return 0;
 	fb = CPostEffects::pRasterFrontBuffer;
-	camR = RwCameraGetRaster(Scene.camera);
-	if(fb == nil || camR == nil)
+	if(fb == nil)
 		return 0;
-	if(fb == camR){
-		// early frames keep the camera on the same raster - the stock
-		// copy would copy the raster onto itself; skip, nothing to do
-		return 1;
-	}
+	sfxLiveUpload();
+	if(sfxLiveRaster == nil)
+		return 0;
+	// the vanilla write: CPU blit, 1:1 into the padded front buffer
 	RwRasterPushContext(fb);
-	CPostEffects::ImmediateModeRenderStatesStore();
-	CPostEffects::ImmediateModeRenderStatesSet();
-	CPostEffects::DrawQuadSetDefaultUVs();
-	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
-	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
-	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
-	CPostEffects::DrawQuad(0.0f, 0.0f, (float)camR->width, (float)camR->height,
-		255, 255, 255, 255, camR);
-	CPostEffects::ImmediateModeRenderStatesReStore();
+	RwRasterRenderFast(sfxLiveRaster, 0, 0);
 	RwRasterPopContext();
+	if(sfxLog && sfxLogUF < 4){
+		sfxLogUF++;
+		fprintf(sfxLog, "U2 live upload %dx%d\n", sfxLiveW, sfxLiveH);
+	}
 	return 1;
 }
 
@@ -272,9 +354,9 @@ sfxLiveCopyFB(void)
 static int sfxLiveFilledAt = -1;
 
 // v9.36: SEH wrapper. Copies the live back buffer content into the
-// front buffer through sfxLiveCopyFB (PushContext bracket + Im2D
-// quad). Any fault falls back to the stock copy and disables the
-// live path.
+// front buffer through sfxLiveCopyFB (CPU readback + vanilla
+// RenderFast write, once per frame). Any fault falls back to the
+// stock copy and disables the live path.
 static int
 sfxHDRfillLive(void)
 {
@@ -324,12 +406,11 @@ CPostEffects::UpdateFrontBuffer(void)
 	// filled AFTER the filter had already read last frame's content -
 	// a same-frame feedback loop that accumulated into the blurred
 	// warm wash (screenshot 76), the white-out peaks and the warm
-	// snap. v9.36g: the copy runs in the vanilla write bracket
-	// (RwRasterPushContext) and lands the camera raster 1:1 in the
-	// filter's padded front buffer with the proven caller state
-	// pattern (see sfxLiveCopyFB) - the current back buffer every
-	// time, so the every-refresh call matches the vanilla semantics
-	// exactly.
+	// snap. v9.38: the copy is the vanilla CPU write (RenderFast into
+	// the padded front buffer, 1:1) fed once per frame from the live
+	// back buffer (see sfxLiveCopyFB), so every pass reads the same
+	// current image and the every-refresh call matches the vanilla
+	// semantics exactly.
 	if(sfxHDRready && sfxBBRaster != nil
 		&& RwCameraGetRaster(Scene.camera) == sfxBBRaster){
 		if(sfxHDRfillLive())
@@ -1866,7 +1947,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.37) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.38) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
