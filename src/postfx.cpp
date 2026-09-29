@@ -191,7 +191,12 @@ static int sfxLogLive;
 // released one three times per frame - most of the added FPS drop)
 static IDirect3DSurface9 *sfxSysSurf;
 static int sfxSysW, sfxSysH;
-static int sfxLogSkip;
+// v9.53: per-frame timing - microseconds spent in UpdateFrontBuffer
+// (the live readback) and the full frame (DFE heartbeat), so the log
+// quantifies exactly what the readback costs on this machine
+static long long sfxUFUs;
+static long long sfxFrameLastQPC;
+static int sfxLogTiming;
 // v9.50b: forward declaration - UpdateFrontBuffer logs before the
 // declaration block further down (CI C3861)
 static void sfxLogLine(const char *fmt, ...);
@@ -245,6 +250,8 @@ sfxBBRegister(RwRaster *camR)
 void
 CPostEffects::UpdateFrontBuffer(void)
 {
+	LARGE_INTEGER c0, c1;
+	QueryPerformanceCounter(&c0);
 	// v9.32: hdr path - the camera raster is the swap-chain back
 	// buffer, so the stock copy below would feed the chain RW's stale
 	// system copy of it (the frozen beige). Fill the front buffer from
@@ -305,43 +312,21 @@ CPostEffects::UpdateFrontBuffer(void)
 		D3DSURFACE_DESC d;
 		D3DLOCKED_RECT lr;
 		int done = 0, locked = 0;
-		// v9.52: THE FEEDBACK KILL + THE FPS FIX. The v9.51 log caught
-		// the bifurcation red-handed: at every visible jump (SNAPF) the
-		// fp16 scene surface was normal and smooth (H16S), while the
-		// BACK BUFFER flipped green/warm - and at f=889 the back buffer
-		// was pure black for a frame while fp16 held the full scene.
-		// The flip therefore lives in the post-resolve half, and the
-		// only bb->bb channel there is this copy chain: the back
-		// buffer was copied into the front raster THREE times per
-		// frame and radiosity/composite sample that raster back onto
-		// the back buffer - a per-frame RECURSION with stable states
-		// (green/warm/black) that camera swings tip between. The black
-		// attractor also explains the pause black/white background:
-		// pausing freezes a black frame. And the triple readback was
-		// the FPS drop. Fix: fill the front raster ONCE per frame,
-		// immediately after the scene resolve (the back buffer then
-		// holds THIS frame's clean scene - a pure function of the
-		// scene, no feedback), and make the later refreshes no-ops.
-		static unsigned int sfxUFLiveToken = 0;
+		// v9.53: the v9.52 once-per-frame skip is REVERTED. The log
+		// proved the later refreshes are load-bearing: the radiosity
+		// downsample passes write their SCRATCH into this very raster,
+		// and the colour filter + composite sample it afterwards -
+		// skipping the refills made them read quarter-size blur
+		// (Screenshot 103: blurred world, no HUD in the ON state).
+		// Every refresh gets a live fill again (correct content,
+		// vanilla semantics, no camera-context pair so the presented
+		// back buffer is never cleared - the v9.51 pause fix stays).
+		// The readback cost is now MEASURED per frame (the T line in
+		// the log) so moving the copy fully onto the GPU is decided
+		// on data, not guesswork.
 		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
-		   sfxUFLiveToken == (unsigned int)sfxProbeFrame){
-			// 2nd/3rd refresh of this frame: skip - neither the live
-			// fill (it would re-introduce the recursion) nor the stale
-			// stock copy; leave the clean fill in place
-			done = 1;
-			if(sfxLogSkip < 20){
-				sfxLogSkip++;
-				sfxLogLine("UF2 skip n=%d pf=%d\n", sfxLogSkip, sfxProbeFrame);
-			}
-		}else if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
 		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil &&
 		   bb->GetDesc(&d) == D3D_OK){
-			sfxUFLiveToken = (unsigned int)sfxProbeFrame;
-			// v9.52: at this point (first refresh of the frame, right
-			// after the scene resolve) the back buffer holds THIS
-			// frame's clean scene - copying it now is a pure function
-			// of the scene, so nothing of frame n-1 can leak into
-			// frame n through this raster anymore
 			if(sfxSysSurf == nil ||
 			   sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
 				if(sfxSysSurf)
@@ -381,7 +366,7 @@ CPostEffects::UpdateFrontBuffer(void)
 					done = 1;
 					if(sfxLogLive < 40){
 						sfxLogLive++;
-						sfxLogLine("UF2 clean n=%d %dx%d pf=%d\n", sfxLogLive, sfxLiveW, sfxLiveH, sfxProbeFrame);
+						sfxLogLine("UF2 fill n=%d %dx%d pf=%d\n", sfxLogLive, sfxLiveW, sfxLiveH, sfxProbeFrame);
 					}
 				}
 			}
@@ -410,6 +395,13 @@ CPostEffects::UpdateFrontBuffer(void)
 			RwRasterPopContext();
 			RwCameraBeginUpdate(Scene.camera);
 		}
+	}
+	QueryPerformanceCounter(&c1);
+	{
+		static LARGE_INTEGER sfxQPF;
+		if(sfxQPF.QuadPart == 0)
+			QueryPerformanceFrequency(&sfxQPF);
+		sfxUFUs += ((c1.QuadPart - c0.QuadPart) * 1000000) / sfxQPF.QuadPart;
 	}
 }
 
@@ -2022,7 +2014,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.52) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.53) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3848,6 +3840,23 @@ CPostEffects::DrawFinalEffects(void)
 	}
 	// v9.30i: proof-of-life marker - if the mod post chain (bloom,
 	// exposure, vignette) ever stops on a machine, these lines stop
+	// v9.53: frame + readback timing heartbeat (every ~30 frames)
+	{
+		static LARGE_INTEGER sfxQPF;
+		LARGE_INTEGER n;
+		if(sfxQPF.QuadPart == 0)
+			QueryPerformanceFrequency(&sfxQPF);
+		QueryPerformanceCounter(&n);
+		if(sfxFrameLastQPC != 0 && sfxLogTiming < 400 &&
+		   (sfxProbeFrame % 30) == 0){
+			sfxLogTiming++;
+			sfxLogLine("T f=%d uf=%lldus frame=%lldus\n",
+				sfxProbeFrame, sfxUFUs,
+				((n.QuadPart - sfxFrameLastQPC) * 1000000) / sfxQPF.QuadPart);
+		}
+		sfxFrameLastQPC = n.QuadPart;
+		sfxUFUs = 0;
+	}
 	if(sfxLogDFE++ < 600)
 		sfxLogLine("DFE n=%d\n", sfxLogDFE);
 
