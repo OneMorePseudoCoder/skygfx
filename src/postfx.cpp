@@ -250,6 +250,7 @@ sfxLiveCopyFB(void)
 // front buffer through sfxLiveCopyFB (PushContext bracket + Im2D
 // quad). Any fault falls back to the stock copy and disables the
 // live path.
+static int
 sfxHDRfillLive(void)
 {
 	int ok = 1;
@@ -1836,7 +1837,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36f) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.36f2) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
