@@ -259,14 +259,13 @@ static int sfxRbW, sfxRbH;
 // (declared at the top of this file) - they are reused here, NOT
 // redeclared (C2086; grep the whole file before adding any static).
 static int sfxLogRb;
-// v9.61: set by sfxHoldPresent (Clear hook) for the pause frame it
-// filled; DFE clears it so the next pause frame holds again. DFE only
-// runs its own (menu-covering) hold when no full-size clear fired.
-static int sfxHoldDrawn;
-// v9.61: rolling frozen copy (once per unpaused frame) + the hold
-// presented from the Clear hook before the vanilla menu draws
+// v9.62: rolling frozen copy (one StretchRect per unpaused frame).
+// The hold itself is presented from the DFE pause gate: the v9.60 test
+// proved the vanilla menu draws land BEFORE DFE (menu visible under
+// the hold), the v9.61 test proved the Clear-hook hold covers the menu
+// entirely (it fires before those draws). DFE location + rolling
+// menu-free content = frozen scene with a LIVE menu, both states.
 static void sfxHoldRolling(void);
-static void sfxHoldPresent(void);
 // v9.59: pause hold - defined further down (it needs the D3D vtable
 // helper declarations). Re-presents the frozen GPU copy on the
 // presented buffer every pause frame so the swap chain never serves
@@ -2114,7 +2113,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.61b) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.62) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2358,13 +2357,7 @@ sfxClearHook(void *dev, unsigned int count, void *rects,
 			sfxLogLine("Zc strip f=%x\n", flags);
 	}else if(sfxLogZ0++ < 8)
 		sfxLogLine("Zc f=%x c=%x\n", flags, color);
-	int chr = d3dClearOrig(dev, count, rects, flags, color, z, stencil);
-	// v9.61: a full-size colour clear marks the start of a pause frame;
-	// present the held frame here - BEFORE the vanilla menu draws - so
-	// the pause menu stays live over the frozen scene (both states).
-	if(sfxPaused() && !sfxHoldDrawn && (flags & 0x1u) && count == 0)
-		sfxHoldPresent();
-	return chr;
+	return d3dClearOrig(dev, count, rects, flags, color, z, stencil);
 }
 
 static void
@@ -3874,112 +3867,6 @@ sfxHoldRolling(void)
 	bb->Release();
 }
 
-// v9.61: the pause hold, take two. Runs from the Clear hook right after
-// a full-size colour clear - i.e. BEFORE the vanilla menu draws - so the
-// held frame sits under a LIVE menu and the selection moves again. Pure
-// device-level on the currently bound target (no RW camera juggling
-// inside the clear path); only fires when that target IS the back
-// buffer (shadow/env-map clears pass through untouched).
-static void
-sfxHoldPresent(void)
-{
-	struct HDRVtx { float x, y, z, rhw, u, v; } v[4];
-	IDirect3DSurface9 *bb = nil, *cur = nil;
-	D3DSURFACE_DESC bd, cd;
-	struct SfxD3DViewport oldvp, fullvp;
-	DWORD oldZen = 0, oldCull = 0, oldBlend = 0;
-	DWORD oldSc = 0, oldAt = 0, oldSt = 0, oldCw = 0;
-	HRESULT hr;
-	static int sfxHoldLogged;
-	float w, h;
-	int i;
-	if(d3d9device == nil || sfxCopyTex == nil || sfxCopySurf == nil)
-		return;
-	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
-	   || bb == nil)
-		return;
-	if(d3d9device->GetRenderTarget(0, &cur) != D3D_OK || cur == nil){
-		bb->Release();
-		return;
-	}
-	if(cur->GetDesc(&cd) != D3D_OK || bb->GetDesc(&bd) != D3D_OK
-	   || cd.Width != bd.Width || cd.Height != bd.Height
-	   || cd.Format != bd.Format){
-		cur->Release();
-		bb->Release();
-		return;
-	}
-	cur->Release();
-	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
-	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
-	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
-	d3d9device->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldSc);
-	d3d9device->GetRenderState(D3DRS_ALPHATESTENABLE, &oldAt);
-	d3d9device->GetRenderState(D3DRS_STENCILENABLE, &oldSt);
-	d3d9device->GetRenderState(D3DRS_COLORWRITEENABLE, &oldCw);
-	d3dGetViewport(d3d9device, &oldvp);
-	fullvp.x = 0;
-	fullvp.y = 0;
-	fullvp.width = bd.Width;
-	fullvp.height = bd.Height;
-	fullvp.minz = 0.0f; // SfxD3DViewport fields are lowercase (CI C2039)
-	fullvp.maxz = 1.0f;
-	d3dSetViewportOrig(d3d9device, &fullvp);
-	d3d9device->SetRenderState(D3DRS_ZENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
-	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-	d3d9device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-	d3d9device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-	d3d9device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-	{
-		IDirect3DPixelShader9 *ps = nil;
-		d3d9device->GetPixelShader(&ps);
-		if(ps != nil){
-			d3d9device->SetPixelShader(nil);
-			ps->Release();
-		}
-	}
-	d3d9device->SetTexture(0, sfxCopyTex);
-	d3d9device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-	w = (float)bd.Width;
-	h = (float)bd.Height;
-	v[0].x = -0.5f;    v[0].y = -0.5f;    v[0].u = 0.0f; v[0].v = 0.0f;
-	v[1].x = w - 0.5f; v[1].y = -0.5f;    v[1].u = 1.0f; v[1].v = 0.0f;
-	v[2].x = -0.5f;    v[2].y = h - 0.5f; v[2].u = 0.0f; v[2].v = 1.0f;
-	v[3].x = w - 0.5f; v[3].y = h - 0.5f; v[3].u = 1.0f; v[3].v = 1.0f;
-	for(i = 0; i < 4; i++){
-		v[i].z = 0.0f;
-		v[i].rhw = 1.0f;
-	}
-	hr = d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v,
-		sizeof(struct HDRVtx));
-	if(hr != D3D_OK && sfxLogCopy < 8){
-		sfxLogCopy++;
-		sfxLogLine("HOLD present FAILED hr=%08x\n", (unsigned int)hr);
-	}
-	d3d9device->SetTexture(0, nil);
-	d3d9device->SetRenderState(D3DRS_ZENABLE, oldZen);
-	d3d9device->SetRenderState(D3DRS_CULLMODE, oldCull);
-	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, oldBlend);
-	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, oldSc);
-	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, oldAt);
-	d3d9device->SetRenderState(D3DRS_STENCILENABLE, oldSt);
-	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, oldCw);
-	d3dSetViewportOrig(d3d9device, &oldvp);
-	bb->Release();
-	sfxHoldDrawn = 1;
-	if(!sfxHoldLogged && sfxLogCopy < 8){
-		sfxHoldLogged = 1;
-		sfxLogLine("HOLDCL engaged\n");
-	}
-}
-
 static void
 RenderScale_DeferredStretch(void)
 {
@@ -4282,14 +4169,11 @@ CPostEffects::DrawFinalEffects(void)
 	if(sfxPaused()){
 		// v9.57: paused - no composite; the presented frame stays the
 		// last real one (with HUD)
-		// v9.61: the Clear hook does the hold BEFORE the vanilla menu
-		// draws (live pause menu). Only when no full-size clear fired
-		// this pause frame does the DFE-side hold run - it covers the
-		// menu (the v9.60 frozen-selection behaviour) but guarantees
-		// the screen always has full content in both states.
-		if(!sfxHoldDrawn)
-			sfxPauseHold(RwCameraGetRaster(Scene.camera));
-		sfxHoldDrawn = 0;
+		// v9.62: the hold runs HERE every pause frame - after the
+		// vanilla menu draws (v9.60 proof) - with the rolling menu-free
+		// copy (v9.61 proof), so the frozen scene sits UNDER a live
+		// menu and the selection moves again. Both states.
+		sfxPauseHold(RwCameraGetRaster(Scene.camera));
 		sfxUFUs = 0;
 		return;
 	}
