@@ -259,13 +259,13 @@ static int sfxRbW, sfxRbH;
 // (declared at the top of this file) - they are reused here, NOT
 // redeclared (C2086; grep the whole file before adding any static).
 static int sfxLogRb;
-// v9.65: menu state read DIRECTLY from CMenuManager::m_bMenuActive
-// (bool at FrontEndMenuManager 0xBA6748 + 0x5C = 0xBA67A4, SA 1.0 US
-// layout; same pointer-read pattern as the CTimer pause bytes in
-// sfxPaused()). The v9.64 log proved ESC only blips sfxPaused() for
-// 3-4 frames and the CLOSING press never blips at all ("HOLD menu
-// open" with no "HOLD menu close"), so edge-counting the blip left
-// the gate stuck ON for the whole session.
+// v9.66: menu state via the transition pulse at 0xBA67A4. The v9.65
+// test proved that byte is NOT the persistent m_bMenuActive: it is 1
+// for exactly one frame at menu open and one frame at menu close, 0
+// in between (log: the open and close lines one frame apart). The
+// open pulse lands inside the 3-4 frame pause blip, the close pulse
+// comes without one - the gate samples the pulse and lets
+// sfxPaused() pick which transition it was.
 static int sfxMenuOpen;
 // v9.65: rolling back-buffer copy, DOUBLE-BUFFERED. The hold presents
 // the pair captured LAST frame while the fresh capture goes into the
@@ -2125,7 +2125,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.65) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.66) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -4192,29 +4192,36 @@ CPostEffects::DrawFinalEffects(void)
 		sfxFrameLastQPC = n.QuadPart;
 		sfxUFUs = 0;
 	}
-	// v9.65: menu state comes straight from CMenuManager::m_bMenuActive
-	// (0xBA67A4) - see the file-scope note above. v9.64 counted blip
-	// edges instead, but the closing ESC never blips: one "HOLD menu
-	// open" and zero "HOLD menu close" in the v9.64 log.
-	sfxMenuOpen = *(char *)0xBA67A4 != 0;
+	// v9.66: 0xBA67A4 is a transition PULSE in this exe - the v9.65 log
+	// shows it 1 for exactly one frame at menu open and one frame at
+	// menu close, 0 in between (so it is not the persistent
+	// m_bMenuActive). The open pulse lands inside the 3-4 frame pause
+	// blip (v9.63 log), the close pulse comes without a blip - sample
+	// the pulse and let sfxPaused() say which transition it was.
 	{
-		static int sfxMenuPrev = -1;
-		if((int)sfxMenuOpen != sfxMenuPrev && sfxLogCopy < 8){
-			sfxMenuPrev = (int)sfxMenuOpen;
-			sfxLogCopy++;
-			sfxLogLine("HOLD menu %s\n", sfxMenuOpen ? "open" : "close");
+		static int sfxMenuPulsePrev = 0;
+		int pulse = *(char *)0xBA67A4 != 0;
+		if(pulse && !sfxMenuPulsePrev){
+			sfxMenuOpen = sfxPaused();
+			if(sfxLogCopy < 8){
+				sfxLogCopy++;
+				sfxLogLine("HOLD menu %s\n", sfxMenuOpen ? "open" : "close");
+			}
 		}
+		sfxMenuPulsePrev = pulse;
 	}
 	if(sfxPaused() || sfxMenuOpen){
 		// v9.57: paused - no composite; the presented frame stays the
 		// last real one (with HUD)
-		// v9.65: present FIRST (last frame's capture), then recapture
-		// into the other pair - never draw from the texture written
-		// this frame (the v9.64 flicker). The DFE-entry capture
-		// carries this frame's live menu: menu visible + live while
-		// the menu-erasing composite stays skipped.
-		sfxPauseHold(RwCameraGetRaster(Scene.camera));
+		// v9.66: capture FIRST - the DFE-entry back buffer carries this
+		// frame's live menu over the scene - then present LAST frame's
+		// pair. The ping-pong keeps the fresh write and the presented
+		// read on different textures, so there is no v9.64-style hazard
+		// in this order either. v9.65 had the two inverted: the fresh
+		// capture then contained the re-presented old frame instead of
+		// the menu, and the screen froze on the pre-pause frame.
 		sfxHoldRolling();
+		sfxPauseHold(RwCameraGetRaster(Scene.camera));
 		sfxUFUs = 0;
 		return;
 	}
