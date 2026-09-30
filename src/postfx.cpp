@@ -259,19 +259,21 @@ static int sfxRbW, sfxRbH;
 // (declared at the top of this file) - they are reused here, NOT
 // redeclared (C2086; grep the whole file before adding any static).
 static int sfxLogRb;
-// v9.63: set by the Clear hook when the pause hold landed on the back
-// buffer this pause frame; the DFE pause gate runs its fallback hold
-// only when this was NOT set, then clears it. File-scope on purpose:
-// written in sfxClearHook, read/reset in DrawFinalEffects (the proven
-// v9.61 sfxHoldDrawn pattern, renamed).
-static int sfxHoldClrDid;
-// v9.63: rolling frozen copy (one StretchRect per unpaused frame).
-// The hold is presented from the Clear hook, right after the frame
-// clear and BEFORE the vanilla menu draws, so the frozen scene sits
-// under a LIVE menu. v9.60 proved the menu draws land before DFE, so
-// a DFE-side hold always covers the menu (the shared v9.61b/v9.62
-// result); v9.61's Clear-hook hold never landed (menu stayed hidden
-// while its fallback ran) and the v9.63 logs say exactly why.
+// v9.64: the frontend menu is OPEN while these are set. The v9.63
+// logs proved ESC only blips sfxPaused() for 3-4 frames while the
+// timer and the frame loop keep running, and that the menu draws
+// EARLY in its frames, before DFE (the v9.60 first-pause capture
+// baked it) - so the full-screen composite at DFE erased the menu
+// every frame (hdrBuffer=1 only; A/B: hdrBuffer=0 is clean).
+// sfxMenuOpen toggles on each sfxPaused() rising edge; sfxPausePrev
+// is the previous-frame pause flag for that edge detect.
+static int sfxMenuOpen, sfxPausePrev;
+// v9.64: rolling copy of the back buffer. While the menu is open (or
+// paused) it runs at DFE entry and carries THIS frame's live menu
+// over the last finished game frame; the gate below then SKIPS the
+// composite (the menu eraser) and re-presents the capture, so the
+// menu stays live over a frozen scene - behaving like the proven
+// clean hdrBuffer=0 path while it is open.
 static void sfxHoldRolling(void);
 // v9.59: pause hold - defined further down (it needs the D3D vtable
 // helper declarations). Re-presents the frozen GPU copy on the
@@ -2120,7 +2122,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.63) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.64) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2364,64 +2366,11 @@ sfxClearHook(void *dev, unsigned int count, void *rects,
 			sfxLogLine("Zc strip f=%x\n", flags);
 	}else if(sfxLogZ0++ < 8)
 		sfxLogLine("Zc f=%x c=%x\n", flags, color);
-	int chr = d3dClearOrig(dev, count, rects, flags, color, z, stencil);
-	{
-		// v9.63: present the hold right after the frame clear and
-		// BEFORE the vanilla menu draws, so the frozen scene sits under
-		// a LIVE menu (selection keeps moving). A hold at DFE runs after
-		// those draws and always covers the menu (shared v9.61b/v9.62
-		// result). Fires only on a full-size colour clear while paused;
-		// it lands only when the cleared target IS the back buffer -
-		// otherwise the DFE fallback covers the frame and the log says
-		// which side presented.
-		IDirect3DSurface9 *bb = nil, *cur = nil;
-		D3DSURFACE_DESC bd, cd;
-		static int sfxHoldClrN;
-		static int sfxHoldClrLog = 4;
-		static int sfxHoldClrWas;
-		if(sfxPaused()){
-			if(!sfxHoldClrWas){
-				sfxHoldClrN = 0;
-				sfxHoldClrLog = 4;
-				sfxHoldClrWas = 1;
-			}
-			if((flags & 0x1u) && count == 0 &&
-			   d3d9device != nil &&
-			   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK &&
-			   bb != nil){
-				if(d3d9device->GetRenderTarget(0, &cur) == D3D_OK && cur != nil){
-					if(cur->GetDesc(&cd) == D3D_OK && bb->GetDesc(&bd) == D3D_OK &&
-					   cd.Width == bd.Width && cd.Height == bd.Height &&
-					   cd.Format == bd.Format){
-						sfxHoldClrN++;
-						if((sfxHoldClrLog > 0 && sfxHoldClrLog--) ||
-						   sfxHoldClrN % 300 == 0){
-							if(sfxLogCopy < 8){
-								sfxLogCopy++;
-								sfxLogLine("HOLD clr#%d %dx%d\n",
-								    sfxHoldClrN, sfxCopyW, sfxCopyH);
-							}
-						}
-						sfxPauseHold(RwCameraGetRaster(Scene.camera));
-						sfxHoldClrDid = 1;
-					}else if(sfxHoldClrLog > 0 && sfxHoldClrLog--){
-						if(sfxLogCopy < 8)
-							sfxLogLine("HOLD clr skip rt\n");
-					}
-					cur->Release();
-				}else if(sfxHoldClrLog > 0 && sfxHoldClrLog--){
-					if(sfxLogCopy < 8)
-						sfxLogLine("HOLD clr skip grt\n");
-				}
-				bb->Release();
-			}else if(sfxHoldClrLog > 0 && sfxHoldClrLog--){
-				if(sfxLogCopy < 8)
-					sfxLogLine("HOLD clr skip f=%x\n", flags);
-			}
-		}else
-			sfxHoldClrWas = 0;
-	}
-	return chr;
+	// v9.64: pure passthrough again - the v9.63 logs proved a paused
+	// frame never issues a colour clear at all (only flags=6 Z+stencil
+	// clears), so a clear-side hold had nothing to attach to. The fix
+	// lives entirely in the DFE gate now.
+	return d3dClearOrig(dev, count, rects, flags, color, z, stencil);
 }
 
 static void
@@ -4230,25 +4179,28 @@ CPostEffects::DrawFinalEffects(void)
 		sfxFrameLastQPC = n.QuadPart;
 		sfxUFUs = 0;
 	}
-	if(sfxPaused()){
+	// v9.64: ESC toggles the frontend menu WITHOUT holding a real
+	// pause - the v9.63 logs show 3-4 frame sfxPaused() blips while
+	// the timer and the frame loop keep running. Capture the back
+	// buffer at DFE entry on menu frames (it holds THIS frame's live
+	// menu over the last finished game frame), skip the composite -
+	// which is what erased the menu in every build since v9.57 -
+	// and re-present the capture: live menu over a frozen scene,
+	// i.e. the proven-clean hdrBuffer=0 behaviour while open.
+	if(sfxPaused() && !sfxPausePrev){
+		sfxMenuOpen = !sfxMenuOpen;
+		if(sfxLogCopy < 8){
+			sfxLogCopy++;
+			sfxLogLine("HOLD menu %s\n", sfxMenuOpen ? "open" : "close");
+		}
+	}
+	sfxPausePrev = sfxPaused();
+	if(sfxMenuOpen || sfxPaused())
+		sfxHoldRolling();
+	if(sfxPaused() || sfxMenuOpen){
 		// v9.57: paused - no composite; the presented frame stays the
 		// last real one (with HUD)
-		// v9.63: the Clear hook presents the hold right after the frame
-		// clear, BEFORE the vanilla menu draws, so the frozen scene sits
-		// UNDER a live menu. A hold here at DFE runs after those draws
-		// and covers the menu (shared v9.61b/v9.62 result), so it only
-		// runs as a fallback when no clear-side present landed this
-		// pause frame; the log says which one did the work.
-		if(!sfxHoldClrDid){
-			static int sfxHoldFbLog = 3;
-			if(sfxHoldFbLog > 0){
-				sfxHoldFbLog--;
-				if(sfxLogCopy < 8)
-					sfxLogLine("HOLD dfe fallback\n");
-			}
-			sfxPauseHold(RwCameraGetRaster(Scene.camera));
-		}
-		sfxHoldClrDid = 0;
+		sfxPauseHold(RwCameraGetRaster(Scene.camera));
 		sfxUFUs = 0;
 		return;
 	}
