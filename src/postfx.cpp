@@ -2114,7 +2114,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.61) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.61b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3922,8 +3922,8 @@ sfxHoldPresent(void)
 	fullvp.y = 0;
 	fullvp.width = bd.Width;
 	fullvp.height = bd.Height;
-	fullvp.minZ = 0.0f;
-	fullvp.maxZ = 1.0f;
+	fullvp.minz = 0.0f; // SfxD3DViewport fields are lowercase (CI C2039)
+	fullvp.maxz = 1.0f;
 	d3dSetViewportOrig(d3d9device, &fullvp);
 	d3d9device->SetRenderState(D3DRS_ZENABLE, FALSE);
 	d3d9device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
