@@ -259,21 +259,24 @@ static int sfxRbW, sfxRbH;
 // (declared at the top of this file) - they are reused here, NOT
 // redeclared (C2086; grep the whole file before adding any static).
 static int sfxLogRb;
-// v9.64: the frontend menu is OPEN while these are set. The v9.63
-// logs proved ESC only blips sfxPaused() for 3-4 frames while the
-// timer and the frame loop keep running, and that the menu draws
-// EARLY in its frames, before DFE (the v9.60 first-pause capture
-// baked it) - so the full-screen composite at DFE erased the menu
-// every frame (hdrBuffer=1 only; A/B: hdrBuffer=0 is clean).
-// sfxMenuOpen toggles on each sfxPaused() rising edge; sfxPausePrev
-// is the previous-frame pause flag for that edge detect.
-static int sfxMenuOpen, sfxPausePrev;
-// v9.64: rolling copy of the back buffer. While the menu is open (or
-// paused) it runs at DFE entry and carries THIS frame's live menu
-// over the last finished game frame; the gate below then SKIPS the
-// composite (the menu eraser) and re-presents the capture, so the
-// menu stays live over a frozen scene - behaving like the proven
-// clean hdrBuffer=0 path while it is open.
+// v9.65: menu state read DIRECTLY from CMenuManager::m_bMenuActive
+// (bool at FrontEndMenuManager 0xBA6748 + 0x5C = 0xBA67A4, SA 1.0 US
+// layout; same pointer-read pattern as the CTimer pause bytes in
+// sfxPaused()). The v9.64 log proved ESC only blips sfxPaused() for
+// 3-4 frames and the CLOSING press never blips at all ("HOLD menu
+// open" with no "HOLD menu close"), so edge-counting the blip left
+// the gate stuck ON for the whole session.
+static int sfxMenuOpen;
+// v9.65: rolling back-buffer copy, DOUBLE-BUFFERED. The hold presents
+// the pair captured LAST frame while the fresh capture goes into the
+// other pair: v9.64 stretched into the very texture it drew from in
+// the same frame - a read-after-write hazard that produced the
+// white/black garbage frames (Screenshot_110). Presented frames now
+// always show a live (1 frame old) menu over the last finished game
+// frame; the composite - the menu eraser - stays skipped while open,
+// so hdrBuffer=1 behaves like the proven-clean hdrBuffer=0 path.
+static IDirect3DTexture9 *sfxCopyTexB;
+static IDirect3DSurface9 *sfxCopySurfB;
 static void sfxHoldRolling(void);
 // v9.59: pause hold - defined further down (it needs the D3D vtable
 // helper declarations). Re-presents the frozen GPU copy on the
@@ -2122,7 +2125,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.64) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.65) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3833,6 +3836,16 @@ sfxHoldRolling(void)
 	HRESULT hr;
 	if(d3d9device == nil)
 		return;
+	{
+		// v9.65: ping-pong - the fresh capture goes into the back pair;
+		// the hold presented the front pair (last frame's capture)
+		IDirect3DTexture9 *tt = sfxCopyTex;
+		IDirect3DSurface9 *ts = sfxCopySurf;
+		sfxCopyTex = sfxCopyTexB;
+		sfxCopySurf = sfxCopySurfB;
+		sfxCopyTexB = tt;
+		sfxCopySurfB = ts;
+	}
 	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 	   || bb == nil)
 		return;
@@ -4179,28 +4192,29 @@ CPostEffects::DrawFinalEffects(void)
 		sfxFrameLastQPC = n.QuadPart;
 		sfxUFUs = 0;
 	}
-	// v9.64: ESC toggles the frontend menu WITHOUT holding a real
-	// pause - the v9.63 logs show 3-4 frame sfxPaused() blips while
-	// the timer and the frame loop keep running. Capture the back
-	// buffer at DFE entry on menu frames (it holds THIS frame's live
-	// menu over the last finished game frame), skip the composite -
-	// which is what erased the menu in every build since v9.57 -
-	// and re-present the capture: live menu over a frozen scene,
-	// i.e. the proven-clean hdrBuffer=0 behaviour while open.
-	if(sfxPaused() && !sfxPausePrev){
-		sfxMenuOpen = !sfxMenuOpen;
-		if(sfxLogCopy < 8){
+	// v9.65: menu state comes straight from CMenuManager::m_bMenuActive
+	// (0xBA67A4) - see the file-scope note above. v9.64 counted blip
+	// edges instead, but the closing ESC never blips: one "HOLD menu
+	// open" and zero "HOLD menu close" in the v9.64 log.
+	sfxMenuOpen = *(char *)0xBA67A4 != 0;
+	{
+		static int sfxMenuPrev = -1;
+		if((int)sfxMenuOpen != sfxMenuPrev && sfxLogCopy < 8){
+			sfxMenuPrev = (int)sfxMenuOpen;
 			sfxLogCopy++;
 			sfxLogLine("HOLD menu %s\n", sfxMenuOpen ? "open" : "close");
 		}
 	}
-	sfxPausePrev = sfxPaused();
-	if(sfxMenuOpen || sfxPaused())
-		sfxHoldRolling();
 	if(sfxPaused() || sfxMenuOpen){
 		// v9.57: paused - no composite; the presented frame stays the
 		// last real one (with HUD)
+		// v9.65: present FIRST (last frame's capture), then recapture
+		// into the other pair - never draw from the texture written
+		// this frame (the v9.64 flicker). The DFE-entry capture
+		// carries this frame's live menu: menu visible + live while
+		// the menu-erasing composite stays skipped.
 		sfxPauseHold(RwCameraGetRaster(Scene.camera));
+		sfxHoldRolling();
 		sfxUFUs = 0;
 		return;
 	}
