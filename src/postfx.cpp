@@ -247,6 +247,24 @@ static IDirect3DSurface9 *sfxCopySurf;
 static int sfxCopyW, sfxCopyH;
 static int sfxCopyFailed;
 static int sfxLogCopy;
+// v9.59: the v9.58 log killed the flat-gray wash but the HUD still
+// disappears in the ON state - the composite's source (the padded front
+// raster) intermittently misses the HUD even though the fp16 scene and
+// the back buffer are correct at the same moments. The refresh that
+// runs right before the composite therefore goes back to the PROVEN
+// v9.53 content path (GetRenderTargetData -> CPU raster -> blit), the
+// last build whose ON state kept the HUD; refreshes 1-2 stay pure GPU.
+static IDirect3DSurface9 *sfxRbSurf;
+static int sfxRbW, sfxRbH;
+static RwRaster *sfxLiveRaster;
+static int sfxLiveW, sfxLiveH;
+static int sfxLogRb;
+static void sfxCPUFill(RwRaster *dst);
+// v9.59: pause hold - defined further down (it needs the D3D vtable
+// helper declarations). Re-presents the frozen GPU copy on the
+// presented buffer every pause frame so the swap chain never serves
+// cleared/stale frames (the black/white pause background of v9.57).
+static void sfxPauseHold(RwRaster *camR);
 
 // record which raster is the swap-chain-backed camera raster; the
 // resolve calls this every frame right after landing
@@ -367,25 +385,35 @@ CPostEffects::UpdateFrontBuffer(void)
 		// the log) so moving the copy fully onto the GPU is decided
 		// on data, not guesswork.
 		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
-			// v9.57: one pure-GPU copy of the LIVE back buffer into the
-			// padded front buffer - per refresh, no cache, no readback.
-			// First refresh of a frame = the colour filter's call, and it
-			// captures the resolved scene exactly when the vanilla
-			// semantics say so; the end-of-frame call inside
-			// DrawFinalEffects captures the finished frame WITH the HUD,
-			// so the composite can no longer paint over it. Radiosity
-			// refreshes capture the glow the moment it lands - nothing
-			// cached, nothing stale, nothing to snap between.
-			sfxGPUFill(RwCameraGetRaster(Scene.camera),
-				CPostEffects::pRasterFrontBuffer);
-			done = 1;
-			if(sfxLogLive < 40){
-				sfxLogLive++;
-				sfxLogLine("UF2 gpu n=%d %dx%d pf=%d\n", sfxLogLive,
-					RwRasterGetWidth(CPostEffects::pRasterFrontBuffer),
-					RwRasterGetHeight(CPostEffects::pRasterFrontBuffer),
-					sfxProbeFrame);
+			// refreshes 1-2: pure-GPU live copy of the back buffer into
+			// the padded front buffer (v9.57/9.58 path, no readback)
+			// v9.59: refresh 3+ (the one right before the final
+			// composite inside DrawFinalEffects) uses the PROVEN v9.53
+			// readback instead - that build kept the HUD visible in the
+			// ON state, and this makes the composite's source content
+			// identical to it. Costs one readback per frame again (the
+			// v9.53 draw pattern), but only one of the three.
+			static unsigned int sfxFillLast;
+			static int sfxFillIdx;
+			if((unsigned int)sfxProbeFrame != sfxFillLast){
+				sfxFillLast = (unsigned int)sfxProbeFrame;
+				sfxFillIdx = 0;
 			}
+			sfxFillIdx++;
+			if(sfxFillIdx >= 3){
+				sfxCPUFill(CPostEffects::pRasterFrontBuffer);
+			}else{
+				sfxGPUFill(RwCameraGetRaster(Scene.camera),
+					CPostEffects::pRasterFrontBuffer);
+				if(sfxLogLive < 40){
+					sfxLogLive++;
+					sfxLogLine("UF2 gpu n=%d %dx%d pf=%d\n", sfxLogLive,
+						RwRasterGetWidth(CPostEffects::pRasterFrontBuffer),
+						RwRasterGetHeight(CPostEffects::pRasterFrontBuffer),
+						sfxProbeFrame);
+				}
+			}
+			done = 1;
 		}
 		if(!done){
 			// camera on a work raster (radiosity ping-pong): the
@@ -909,6 +937,73 @@ sfxGPUFill(RwRaster *src, RwRaster *dst)
 	d3d9device->SetRenderState(D3DRS_STENCILENABLE, oldSt);
 	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, oldCw);
 	setSceneRaster(src); // camera back onto the presented raster
+}
+
+// v9.59: the proven v9.53 refresh - GetRenderTargetData into a cached
+// systemmem surface, row-copy into our own plain CPU texture raster, blit
+// 1:1 into the padded front raster's top-left (same landing spot as the
+// stock copy, v9.36g). This is exactly the content path the v9.53 build
+// used for every refresh - the last build whose ON state kept the HUD.
+static void
+sfxCPUFill(RwRaster *dst)
+{
+	IDirect3DSurface9 *bb = nil;
+	D3DSURFACE_DESC d;
+	D3DLOCKED_RECT lr;
+	if(d3d9device == nil || dst == nil)
+		return;
+	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
+	   || bb == nil)
+		return;
+	if(bb->GetDesc(&d) != D3D_OK){
+		bb->Release();
+		return;
+	}
+	if(sfxRbSurf == nil || sfxRbW != (int)d.Width || sfxRbH != (int)d.Height){
+		if(sfxRbSurf)
+			sfxRbSurf->Release();
+		sfxRbSurf = nil;
+		if(d3d9device->CreateOffscreenPlainSurface(d.Width, d.Height,
+		                                           d.Format, D3DPOOL_SYSTEMMEM,
+		                                           &sfxRbSurf, nil) == D3D_OK){
+			sfxRbW = d.Width;
+			sfxRbH = d.Height;
+		}
+	}
+	if(sfxRbSurf != nil &&
+	   d3d9device->GetRenderTargetData(bb, sfxRbSurf) == D3D_OK &&
+	   sfxRbSurf->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
+		if(sfxLiveRaster == nil || sfxLiveW != (int)d.Width
+		   || sfxLiveH != (int)d.Height){
+			if(sfxLiveRaster)
+				RwRasterDestroy(sfxLiveRaster);
+			sfxLiveRaster = RwRasterCreate((int)d.Width, (int)d.Height, 32,
+				rwRASTERTYPETEXTURE | rwRASTERFORMAT8888);
+			sfxLiveW = d.Width;
+			sfxLiveH = d.Height;
+		}
+		if(sfxLiveRaster != nil){
+			unsigned char *db = (unsigned char*)RwRasterLock(sfxLiveRaster, 0, 1);
+			if(db != nil){
+				const unsigned char *sr = (const unsigned char*)lr.pBits;
+				int dp = RwRasterGetWidth(sfxLiveRaster) * 4;
+				int y, rows = (int)d.Height, cw = (int)d.Width * 4;
+				for(y = 0; y < rows; y++)
+					memcpy(db + (size_t)y*dp, sr + (size_t)y*lr.Pitch, cw);
+				RwRasterUnlock(sfxLiveRaster);
+				RwRasterPushContext(dst);
+				RwRasterRenderFast(sfxLiveRaster, 0, 0);
+				RwRasterPopContext();
+				if(sfxLogRb < 40){
+					sfxLogRb++;
+					sfxLogLine("UF3 rb n=%d %dx%d pf=%d\n", sfxLogRb,
+						sfxLiveW, sfxLiveH, sfxProbeFrame);
+				}
+			}
+		}
+		sfxRbSurf->UnlockRect();
+	}
+	bb->Release();
 }
 
 void
@@ -2177,7 +2272,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.58) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.59) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3774,6 +3869,101 @@ sfxHDRresolve(RwRaster *camR)
 // CCoronas::Render stub inside RenderEffects - after CMovingThings::Render
 // (Project2DFX LOD lights) and before the fx/HUD draws that need the full
 // raster - and also from DrawFinalEffects as a safety net.
+// v9.59: pause hold - see the comment at the forward declaration.
+// Re-presents the frozen GPU copy onto the swap-chain back buffer every
+// pause frame; the vanilla menu/HUD draws land on top of it right after.
+// Same device-level bracket as sfxHDRresolve (proven since v9.30).
+static void
+sfxPauseHold(RwRaster *camR)
+{
+	struct HDRVtx { float x, y, z, rhw, u, v; } v[4];
+	IDirect3DSurface9 *bb = nil, *ds = nil;
+	DWORD oldZen = 0, oldCull = 0, oldBlend = 0;
+	DWORD oldSc = 0, oldAt = 0, oldSt = 0, oldCw = 0;
+	HRESULT hr;
+	static int sfxHoldLogged;
+	float w, h;
+	int i;
+	if(d3d9device == nil || sfxCopyTex == nil || camR == nil)
+		return;
+	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
+	   || bb == nil)
+		return;
+	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
+	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
+	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
+	d3d9device->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldSc);
+	d3d9device->GetRenderState(D3DRS_ALPHATESTENABLE, &oldAt);
+	d3d9device->GetRenderState(D3DRS_STENCILENABLE, &oldSt);
+	d3d9device->GetRenderState(D3DRS_COLORWRITEENABLE, &oldCw);
+	RwCameraEndUpdate(Scene.camera);
+	if(d3dGetDepthStencil)
+		d3dGetDepthStencil(d3d9device, &ds);
+	hr = d3d9device->SetRenderTarget(0, bb);
+	bb->Release();
+	if(ds){
+		d3d9device->SetDepthStencilSurface(ds);
+		ds->Release();
+	}
+	if(hr != D3D_OK){
+		RwCameraBeginUpdate(Scene.camera);
+		return;
+	}
+	{
+		struct SfxD3DViewport fullvp = {0, 0, (unsigned int)camR->width,
+			(unsigned int)camR->height, 0.0f, 1.0f};
+		if(d3dSetViewportOrig)
+			d3dSetViewportOrig(d3d9device, &fullvp);
+	}
+	d3d9device->SetRenderState(D3DRS_ZENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	d3d9device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+	d3d9device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	d3d9device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+	{
+		IDirect3DPixelShader9 *ps = nil;
+		d3d9device->GetPixelShader(&ps);
+		if(ps != nil){
+			d3d9device->SetPixelShader(nil);
+			ps->Release();
+		}
+	}
+	d3d9device->SetTexture(0, sfxCopyTex);
+	d3d9device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+	w = (float)camR->width;
+	h = (float)camR->height;
+	v[0].x = -0.5f;    v[0].y = -0.5f;    v[0].u = 0.0f; v[0].v = 0.0f;
+	v[1].x = w - 0.5f; v[1].y = -0.5f;    v[1].u = 1.0f; v[1].v = 0.0f;
+	v[2].x = -0.5f;    v[2].y = h - 0.5f; v[2].u = 0.0f; v[2].v = 1.0f;
+	v[3].x = w - 0.5f; v[3].y = h - 0.5f; v[3].u = 1.0f; v[3].v = 1.0f;
+	for(i = 0; i < 4; i++){
+		v[i].z = 0.0f;
+		v[i].rhw = 1.0f;
+	}
+	d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v,
+		sizeof(struct HDRVtx));
+	d3d9device->SetTexture(0, nil);
+	d3d9device->SetRenderState(D3DRS_ZENABLE, oldZen);
+	d3d9device->SetRenderState(D3DRS_CULLMODE, oldCull);
+	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, oldBlend);
+	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, oldSc);
+	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, oldAt);
+	d3d9device->SetRenderState(D3DRS_STENCILENABLE, oldSt);
+	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, oldCw);
+	RwCameraBeginUpdate(Scene.camera);
+	if(!sfxHoldLogged && sfxLogCopy < 8){
+		sfxHoldLogged = 1;
+		sfxLogLine("PHOLD engaged\n");
+	}
+}
+
 static void
 RenderScale_DeferredStretch(void)
 {
@@ -3860,9 +4050,12 @@ RenderScale_DeferredStretch(void)
 	// resolved before the window and stretched the already upscaled
 	// frame again - the double zoom in the screenshots.)
 	if(sfxPaused()){
-		// v9.57: paused - the post chain stands down; the presented
-		// back buffer keeps the last composited frame and the pause
-		// menu draws on top of it
+		// v9.57: paused - the post chain stands down
+		// v9.59: but keep RE-PRESENTING the frozen frame - the swap
+		// chain keeps serving buffers, and untouched ones alternate
+		// black/white (the pause background). The vanilla menu/HUD
+		// draws land on top of the held frame right after this.
+		sfxPauseHold(camR);
 	}else if(sfxHDRon && sfxHDRresolve(camR)){
 		// resolved straight from the FP16 buffer; the RsGlobal and
 		// NoClear cleanup at the end of this function is shared
