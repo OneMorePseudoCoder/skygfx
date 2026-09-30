@@ -278,6 +278,7 @@ static int sfxMenuOpen;
 static IDirect3DTexture9 *sfxCopyTexB;
 static IDirect3DSurface9 *sfxCopySurfB;
 static void sfxHoldRolling(void);
+static void sfxHoldRotate(void);
 // v9.59: pause hold - defined further down (it needs the D3D vtable
 // helper declarations). Re-presents the frozen GPU copy on the
 // presented buffer every pause frame so the swap chain never serves
@@ -2125,7 +2126,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.66) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.67) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3836,16 +3837,12 @@ sfxHoldRolling(void)
 	HRESULT hr;
 	if(d3d9device == nil)
 		return;
-	{
-		// v9.65: ping-pong - the fresh capture goes into the back pair;
-		// the hold presented the front pair (last frame's capture)
-		IDirect3DTexture9 *tt = sfxCopyTex;
-		IDirect3DSurface9 *ts = sfxCopySurf;
-		sfxCopyTex = sfxCopyTexB;
-		sfxCopySurf = sfxCopySurfB;
-		sfxCopyTexB = tt;
-		sfxCopySurfB = ts;
-	}
+	// v9.67: capture into the BACK pair only. The front pair is what
+	// the hold presents and must not be written in the same frame -
+	// v9.66 rotated first, so the hold presented the texture the
+	// capture had just written (steady black/white frames; the same
+	// read-after-write hazard the v9.64 flicker proved). The gate
+	// rotates the pairs AFTER the present, via sfxHoldRotate.
 	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 	   || bb == nil)
 		return;
@@ -3853,32 +3850,34 @@ sfxHoldRolling(void)
 		bb->Release();
 		return;
 	}
-	if(sfxCopyTex != nil && (sfxCopyW != (int)d.Width || sfxCopyH != (int)d.Height)){
-		if(sfxCopySurf){ sfxCopySurf->Release(); sfxCopySurf = nil; }
-		sfxCopyTex->Release();
-		sfxCopyTex = nil;
+	// v9.67: all capture state below targets the BACK pair (B); the
+	// front pair is only touched by sfxHoldRotate.
+	if(sfxCopyTexB != nil && (sfxCopyW != (int)d.Width || sfxCopyH != (int)d.Height)){
+		if(sfxCopySurfB){ sfxCopySurfB->Release(); sfxCopySurfB = nil; }
+		sfxCopyTexB->Release();
+		sfxCopyTexB = nil;
 	}
-	if(sfxCopyTex == nil && !sfxCopyFailed){
+	if(sfxCopyTexB == nil && !sfxCopyFailed){
 		hr = d3d9device->CreateTexture(d.Width, d.Height, 1,
 			D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT,
-			&sfxCopyTex, nil);
-		if(hr != D3D_OK || sfxCopyTex == nil){
+			&sfxCopyTexB, nil);
+		if(hr != D3D_OK || sfxCopyTexB == nil){
 			sfxCopyFailed = 1;
 			if(sfxLogCopy < 8)
 				sfxLogLine("HOLD create FAILED hr=%08x\n", (unsigned int)hr);
 			bb->Release();
 			return;
 		}
-		sfxCopyTex->GetSurfaceLevel(0, &sfxCopySurf);
+		sfxCopyTexB->GetSurfaceLevel(0, &sfxCopySurfB);
 		sfxCopyW = d.Width;
 		sfxCopyH = d.Height;
 		if(sfxLogCopy < 8){
 			sfxLogCopy++;
-			sfxLogLine("HOLD copytex %dx%d\n", sfxCopyW, sfxCopyH);
+			sfxLogLine("HOLD copytexB %dx%d\n", sfxCopyW, sfxCopyH);
 		}
 	}
-	if(sfxCopySurf != nil){
-		hr = d3d9device->StretchRect(bb, nil, sfxCopySurf, nil, D3DTEXF_NONE);
+	if(sfxCopySurfB != nil){
+		hr = d3d9device->StretchRect(bb, nil, sfxCopySurfB, nil, D3DTEXF_NONE);
 		if(hr != D3D_OK){
 			if(sfxLogCopy < 8){
 				sfxLogCopy++;
@@ -3886,11 +3885,26 @@ sfxHoldRolling(void)
 			}
 			// a lost device invalidates DEFAULT-pool textures - drop
 			// and recreate on the next frame (the sfxHDRtex pattern)
-			if(sfxCopySurf){ sfxCopySurf->Release(); sfxCopySurf = nil; }
-			if(sfxCopyTex){ sfxCopyTex->Release(); sfxCopyTex = nil; }
+			if(sfxCopySurfB){ sfxCopySurfB->Release(); sfxCopySurfB = nil; }
+			if(sfxCopyTexB){ sfxCopyTexB->Release(); sfxCopyTexB = nil; }
 		}
 	}
 	bb->Release();
+}
+
+// v9.67: swap the capture and present pairs - call AFTER the hold
+// presented the front pair, so the next frame presents what was
+// captured this frame and the presented texture is never written
+// and read in the same frame.
+static void
+sfxHoldRotate(void)
+{
+	IDirect3DTexture9 *tt = sfxCopyTex;
+	IDirect3DSurface9 *ts = sfxCopySurf;
+	sfxCopyTex = sfxCopyTexB;
+	sfxCopySurf = sfxCopySurfB;
+	sfxCopyTexB = tt;
+	sfxCopySurfB = ts;
 }
 
 static void
@@ -4213,15 +4227,15 @@ CPostEffects::DrawFinalEffects(void)
 	if(sfxPaused() || sfxMenuOpen){
 		// v9.57: paused - no composite; the presented frame stays the
 		// last real one (with HUD)
-		// v9.66: capture FIRST - the DFE-entry back buffer carries this
-		// frame's live menu over the scene - then present LAST frame's
-		// pair. The ping-pong keeps the fresh write and the presented
-		// read on different textures, so there is no v9.64-style hazard
-		// in this order either. v9.65 had the two inverted: the fresh
-		// capture then contained the re-presented old frame instead of
-		// the menu, and the screen froze on the pre-pause frame.
+		// v9.67: capture FIRST (clean buffer = this frame's live menu
+		// over the scene), then present the OTHER pair - written last
+		// frame, never this one - then rotate the pairs. The menu is
+		// 1 frame old: steady and live. v9.66 rotated before the
+		// present, so the hold read the capture's write target - the
+		// steady black/white frames of the new screenshot.
 		sfxHoldRolling();
 		sfxPauseHold(RwCameraGetRaster(Scene.camera));
+		sfxHoldRotate();
 		sfxUFUs = 0;
 		return;
 	}
@@ -4230,6 +4244,7 @@ CPostEffects::DrawFinalEffects(void)
 	// included, menu never baked in - the v9.60 first-pause capture
 	// baked the menu, which froze the pause selection).
 	sfxHoldRolling();
+	sfxHoldRotate();
 	if(sfxLogDFE++ < 600)
 		sfxLogLine("DFE n=%d\n", sfxLogDFE);
 
