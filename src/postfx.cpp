@@ -226,7 +226,6 @@ sfxPaused(void)
 }
 // v9.57: pure-GPU live fill, forward declaration (defined below after
 // the quad helpers; called by UpdateFrontBuffer above them)
-static void sfxGPUFill(RwRaster *src, RwRaster *dst);
 // v9.57b CI fix: sfxGPUFill calls setSceneRaster, which is defined much
 // further down in this file - declare it here first (C3861; the recurring
 // decl-before-use lesson, re-declaring a static prototype is legal).
@@ -260,7 +259,9 @@ static int sfxRbW, sfxRbH;
 // (declared at the top of this file) - they are reused here, NOT
 // redeclared (C2086; grep the whole file before adding any static).
 static int sfxLogRb;
-static void sfxCPUFill(RwRaster *dst);
+// v9.60: set when the pause hold captured its frozen copy, cleared on
+// the first unpaused frame so the next ESC re-captures
+static int sfxHoldCaptured;
 // v9.59: pause hold - defined further down (it needs the D3D vtable
 // helper declarations). Re-presents the frozen GPU copy on the
 // presented buffer every pause frame so the swap chain never serves
@@ -372,7 +373,10 @@ CPostEffects::UpdateFrontBuffer(void)
 	// passes (camera on workBuffer) keep the stock path; any fault in
 	// the readback falls back to the stock copy (v9.33 pattern).
 	{
-		int done = 0;
+		IDirect3DSurface9 *bb = nil;
+		D3DSURFACE_DESC d;
+		D3DLOCKED_RECT lr;
+		int done = 0, locked = 0;
 		// v9.53: the v9.52 once-per-frame skip is REVERTED. The log
 		// proved the later refreshes are load-bearing: the radiosity
 		// downsample passes write their SCRATCH into this very raster,
@@ -385,35 +389,68 @@ CPostEffects::UpdateFrontBuffer(void)
 		// The readback cost is now MEASURED per frame (the T line in
 		// the log) so moving the copy fully onto the GPU is decided
 		// on data, not guesswork.
-		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
-			// refreshes 1-2: pure-GPU live copy of the back buffer into
-			// the padded front buffer (v9.57/9.58 path, no readback)
-			// v9.59: refresh 3+ (the one right before the final
-			// composite inside DrawFinalEffects) uses the PROVEN v9.53
-			// readback instead - that build kept the HUD visible in the
-			// ON state, and this makes the composite's source content
-			// identical to it. Costs one readback per frame again (the
-			// v9.53 draw pattern), but only one of the three.
-			static unsigned int sfxFillLast;
-			static int sfxFillIdx;
-			if((unsigned int)sfxProbeFrame != sfxFillLast){
-				sfxFillLast = (unsigned int)sfxProbeFrame;
-				sfxFillIdx = 0;
-			}
-			sfxFillIdx++;
-			if(sfxFillIdx >= 3){
-				sfxCPUFill(CPostEffects::pRasterFrontBuffer);
-			}else{
-				sfxGPUFill(RwCameraGetRaster(Scene.camera),
-					CPostEffects::pRasterFrontBuffer);
-				if(sfxLogLive < 40){
-					sfxLogLive++;
-					sfxLogLine("UF2 gpu n=%d %dx%d pf=%d\n", sfxLogLive,
-						RwRasterGetWidth(CPostEffects::pRasterFrontBuffer),
-						RwRasterGetHeight(CPostEffects::pRasterFrontBuffer),
-						sfxProbeFrame);
+		// v9.60: CONVERGENCE. Four fill architectures were tested since
+		// v9.54 (per-frame cache, RW raster-as-texture quad, own-RT-texture
+		// quad, hybrid selection); only this one - the v9.53 live readback
+		// at EVERY camera-on-bb refresh - ever kept the HUD correct in the
+		// ON state (v9.53 is the last build with no snap/HUD complaints).
+		// The readback cost returns (~8-16ms, the postponed FPS item) and
+		// is accepted until the visuals are confirmed fixed.
+		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
+		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil &&
+		   bb->GetDesc(&d) == D3D_OK){
+			if(sfxSysSurf == nil ||
+			   sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
+				if(sfxSysSurf)
+					sfxSysSurf->Release();
+				sfxSysSurf = nil;
+				if(d3d9device->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+				                                           D3DPOOL_SYSTEMMEM, &sfxSysSurf, nil) == D3D_OK){
+					sfxSysW = d.Width;
+					sfxSysH = d.Height;
 				}
 			}
+			if(sfxSysSurf != nil &&
+			   d3d9device->GetRenderTargetData(bb, sfxSysSurf) == D3D_OK &&
+			   sfxSysSurf->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
+				locked = 1;
+				if(sfxLiveRaster == nil ||
+				   sfxLiveW != (int)d.Width || sfxLiveH != (int)d.Height){
+					if(sfxLiveRaster)
+						RwRasterDestroy(sfxLiveRaster);
+					sfxLiveRaster = RwRasterCreate((int)d.Width, (int)d.Height, 32,
+						rwRASTERTYPETEXTURE | rwRASTERFORMAT8888);
+					sfxLiveW = d.Width;
+					sfxLiveH = d.Height;
+				}
+				if(sfxLiveRaster != nil){
+					unsigned char *dst = (unsigned char*)RwRasterLock(sfxLiveRaster, 0, 1);
+					if(dst != nil){
+						const unsigned char *srcrow = (const unsigned char*)lr.pBits;
+						int dstpitch = RwRasterGetWidth(sfxLiveRaster) * 4;
+						int y, rows = (int)d.Height, cw = (int)d.Width * 4;
+						for(y = 0; y < rows; y++)
+							memcpy(dst + (size_t)y*dstpitch, srcrow + (size_t)y*lr.Pitch, cw);
+						RwRasterUnlock(sfxLiveRaster);
+						RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
+						RwRasterRenderFast(sfxLiveRaster, 0, 0);
+						RwRasterPopContext();
+						done = 1;
+						if(sfxLogLive < 40){
+							sfxLogLive++;
+							sfxLogLine("UF2 fill n=%d %dx%d pf=%d\n", sfxLogLive, sfxLiveW, sfxLiveH, sfxProbeFrame);
+						}
+					}
+				}
+			}
+		}
+		if(!done && sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
+			// readback fault with the camera on the presented buffer -
+			// copy RW's cached copy WITHOUT the camera-context pair
+			// (BeginUpdate would clear the presented back buffer)
+			RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
+			RwRasterRenderFast(RwCameraGetRaster(Scene.camera), 0, 0);
+			RwRasterPopContext();
 			done = 1;
 		}
 		if(!done){
@@ -806,208 +843,7 @@ quadSetUV(RwIm2DVertex *verts, float u0, float v0, float u1, float v1)
 // of the padded target, exactly where the stock RwRasterRenderFast
 // copy lands (v9.36g: a target-sized quad would stretch 1600x900
 // across 2048x1024 and every consumer would read a zoomed crop).
-// v9.58: pure-GPU live fill, take two. src = the camera raster (the
-// swap-chain back buffer), dst = the padded front raster. The back
-// buffer is copied into sfxCopyTex with StretchRect and that texture -
-// ours, always bound, never recreated behind our back - is drawn as one
-// raw XYZRHW quad into dst through the proven setSceneRaster bracket
-// (the same camera-raster swap the radiosity and bloom passes use every
-// frame) with the same state preamble as sfxHDRresolve. The quad covers
-// the SOURCE raster's own rect: 1:1 into the top-left of the padded
-// target, exactly where the stock RwRasterRenderFast copy lands (v9.36g).
-static void
-sfxGPUFill(RwRaster *src, RwRaster *dst)
-{
-	struct HDRVtx { float x, y, z, rhw, u, v; } v[4];
-	IDirect3DSurface9 *bb = nil;
-	D3DSURFACE_DESC d;
-	DWORD oldZen = 0, oldCull = 0, oldBlend = 0;
-	DWORD oldSc = 0, oldAt = 0, oldSt = 0, oldCw = 0;
-	HRESULT hr;
-	float w, h;
-	int i;
-	if(d3d9device == nil || src == nil || dst == nil)
-		return;
-	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
-	   || bb == nil)
-		return;
-	if(bb->GetDesc(&d) != D3D_OK){
-		bb->Release();
-		return;
-	}
-	if(sfxCopyTex != nil && (sfxCopyW != (int)d.Width || sfxCopyH != (int)d.Height)){
-		if(sfxCopySurf){ sfxCopySurf->Release(); sfxCopySurf = nil; }
-		sfxCopyTex->Release();
-		sfxCopyTex = nil;
-	}
-	if(sfxCopyTex == nil && !sfxCopyFailed){
-		hr = d3d9device->CreateTexture(d.Width, d.Height, 1,
-			D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT,
-			&sfxCopyTex, nil);
-		if(hr != D3D_OK || sfxCopyTex == nil){
-			sfxCopyFailed = 1;
-			if(sfxLogCopy < 8)
-				sfxLogLine("UFC create FAILED hr=%08x - GPU fill off\n",
-					(unsigned int)hr);
-			bb->Release();
-			return;
-		}
-		sfxCopyTex->GetSurfaceLevel(0, &sfxCopySurf);
-		sfxCopyW = d.Width;
-		sfxCopyH = d.Height;
-		if(sfxLogCopy < 8){
-			sfxLogCopy++;
-			sfxLogLine("UFC copytex %dx%d ready\n", sfxCopyW, sfxCopyH);
-		}
-	}
-	if(sfxCopySurf == nil){
-		bb->Release();
-		return;
-	}
-	// pure GPU: back buffer -> our RT texture. Same-format, same-size
-	// StretchRect - no CPU involvement (the v9.49 GRTD path cost 8-9ms
-	// per frame; this is its GPU-side equivalent).
-	hr = d3d9device->StretchRect(bb, nil, sfxCopySurf, nil, D3DTEXF_NONE);
-	bb->Release();
-	if(hr != D3D_OK){
-		if(sfxLogCopy < 8){
-			sfxLogCopy++;
-			sfxLogLine("UFC stretch FAILED hr=%08x\n", (unsigned int)hr);
-		}
-		// a lost/reset device invalidates DEFAULT-pool textures - drop
-		// ours so the next frame recreates it (the sfxHDRtex pattern)
-		if(sfxCopySurf){ sfxCopySurf->Release(); sfxCopySurf = nil; }
-		if(sfxCopyTex){ sfxCopyTex->Release(); sfxCopyTex = nil; }
-		return;
-	}
-	w = (float)RwRasterGetWidth(src);
-	h = (float)RwRasterGetHeight(src);
-	// same state preamble as sfxHDRresolve (proven since v9.30): the
-	// filter chain leaves all kinds of state behind mid-frame
-	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
-	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
-	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
-	d3d9device->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldSc);
-	d3d9device->GetRenderState(D3DRS_ALPHATESTENABLE, &oldAt);
-	d3d9device->GetRenderState(D3DRS_STENCILENABLE, &oldSt);
-	d3d9device->GetRenderState(D3DRS_COLORWRITEENABLE, &oldCw);
-	setSceneRaster(dst); // camera swap commits the target - the proven
-	                     // radiosity bracket, no raster-surface touching
-	d3d9device->SetRenderState(D3DRS_ZENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
-	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-	d3d9device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-	d3d9device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-	d3d9device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-	d3d9device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-	{
-		IDirect3DPixelShader9 *ps = nil;
-		d3d9device->GetPixelShader(&ps);
-		if(ps != nil){
-			d3d9device->SetPixelShader(nil);
-			ps->Release();
-		}
-	}
-	d3d9device->SetTexture(0, sfxCopyTex);
-	d3d9device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-	v[0].x = -0.5f;   v[0].y = -0.5f;   v[0].u = 0.0f; v[0].v = 0.0f;
-	v[1].x = w - 0.5f; v[1].y = -0.5f;  v[1].u = 1.0f; v[1].v = 0.0f;
-	v[2].x = -0.5f;   v[2].y = h - 0.5f; v[2].u = 0.0f; v[2].v = 1.0f;
-	v[3].x = w - 0.5f; v[3].y = h - 0.5f; v[3].u = 1.0f; v[3].v = 1.0f;
-	for(i = 0; i < 4; i++){
-		v[i].z = 0.0f;
-		v[i].rhw = 1.0f;
-	}
-	hr = d3d9device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v,
-		sizeof(struct HDRVtx));
-	if(hr != D3D_OK && sfxLogCopy < 8){
-		sfxLogCopy++;
-		sfxLogLine("UFC quad FAILED hr=%08x\n", (unsigned int)hr);
-	}
-	d3d9device->SetTexture(0, nil);
-	d3d9device->SetRenderState(D3DRS_ZENABLE, oldZen);
-	d3d9device->SetRenderState(D3DRS_CULLMODE, oldCull);
-	d3d9device->SetRenderState(D3DRS_ALPHABLENDENABLE, oldBlend);
-	d3d9device->SetRenderState(D3DRS_SCISSORTESTENABLE, oldSc);
-	d3d9device->SetRenderState(D3DRS_ALPHATESTENABLE, oldAt);
-	d3d9device->SetRenderState(D3DRS_STENCILENABLE, oldSt);
-	d3d9device->SetRenderState(D3DRS_COLORWRITEENABLE, oldCw);
-	setSceneRaster(src); // camera back onto the presented raster
-}
-
-// v9.59: the proven v9.53 refresh - GetRenderTargetData into a cached
-// systemmem surface, row-copy into our own plain CPU texture raster, blit
-// 1:1 into the padded front raster's top-left (same landing spot as the
-// stock copy, v9.36g). This is exactly the content path the v9.53 build
-// used for every refresh - the last build whose ON state kept the HUD.
-static void
-sfxCPUFill(RwRaster *dst)
-{
-	IDirect3DSurface9 *bb = nil;
-	D3DSURFACE_DESC d;
-	D3DLOCKED_RECT lr;
-	if(d3d9device == nil || dst == nil)
-		return;
-	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
-	   || bb == nil)
-		return;
-	if(bb->GetDesc(&d) != D3D_OK){
-		bb->Release();
-		return;
-	}
-	if(sfxRbSurf == nil || sfxRbW != (int)d.Width || sfxRbH != (int)d.Height){
-		if(sfxRbSurf)
-			sfxRbSurf->Release();
-		sfxRbSurf = nil;
-		if(d3d9device->CreateOffscreenPlainSurface(d.Width, d.Height,
-		                                           d.Format, D3DPOOL_SYSTEMMEM,
-		                                           &sfxRbSurf, nil) == D3D_OK){
-			sfxRbW = d.Width;
-			sfxRbH = d.Height;
-		}
-	}
-	if(sfxRbSurf != nil &&
-	   d3d9device->GetRenderTargetData(bb, sfxRbSurf) == D3D_OK &&
-	   sfxRbSurf->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
-		if(sfxLiveRaster == nil || sfxLiveW != (int)d.Width
-		   || sfxLiveH != (int)d.Height){
-			if(sfxLiveRaster)
-				RwRasterDestroy(sfxLiveRaster);
-			sfxLiveRaster = RwRasterCreate((int)d.Width, (int)d.Height, 32,
-				rwRASTERTYPETEXTURE | rwRASTERFORMAT8888);
-			sfxLiveW = d.Width;
-			sfxLiveH = d.Height;
-		}
-		if(sfxLiveRaster != nil){
-			unsigned char *db = (unsigned char*)RwRasterLock(sfxLiveRaster, 0, 1);
-			if(db != nil){
-				const unsigned char *sr = (const unsigned char*)lr.pBits;
-				int dp = RwRasterGetWidth(sfxLiveRaster) * 4;
-				int y, rows = (int)d.Height, cw = (int)d.Width * 4;
-				for(y = 0; y < rows; y++)
-					memcpy(db + (size_t)y*dp, sr + (size_t)y*lr.Pitch, cw);
-				RwRasterUnlock(sfxLiveRaster);
-				RwRasterPushContext(dst);
-				RwRasterRenderFast(sfxLiveRaster, 0, 0);
-				RwRasterPopContext();
-				if(sfxLogRb < 40){
-					sfxLogRb++;
-					sfxLogLine("UF3 rb n=%d %dx%d pf=%d\n", sfxLogRb,
-						sfxLiveW, sfxLiveH, sfxProbeFrame);
-				}
-			}
-		}
-		sfxRbSurf->UnlockRect();
-	}
-	bb->Release();
-}
-
-void
+oid
 CPostEffects::DrawQuadSetUVs(float utl, float vtl, float utr, float vtr, float ubr, float vbr, float ubl, float vbl)
 {
 	RwIm2DVertexSetU(&ms_imf.quad_verts[0], utl, ms_imf.recipZ);
@@ -2273,7 +2109,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.59b) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.60) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3885,11 +3721,62 @@ sfxPauseHold(RwRaster *camR)
 	static int sfxHoldLogged;
 	float w, h;
 	int i;
-	if(d3d9device == nil || sfxCopyTex == nil || camR == nil)
+	if(d3d9device == nil || camR == nil)
 		return;
 	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 	   || bb == nil)
 		return;
+	// v9.60: the hold owns its frozen copy now. Ensure the RT texture,
+	// and on the FIRST pause frame copy the presented buffer (the last
+	// composited game frame, HUD included) into it; re-captured on the
+	// next pause because DFE clears sfxHoldCaptured while unpaused.
+	{
+		D3DSURFACE_DESC hd;
+		HRESULT hcr;
+		if(bb->GetDesc(&hd) != D3D_OK){
+			bb->Release();
+			return;
+		}
+		if(sfxCopyTex != nil && (sfxCopyW != (int)hd.Width || sfxCopyH != (int)hd.Height)){
+			if(sfxCopySurf){ sfxCopySurf->Release(); sfxCopySurf = nil; }
+			sfxCopyTex->Release();
+			sfxCopyTex = nil;
+		}
+		if(sfxCopyTex == nil && !sfxCopyFailed){
+			hcr = d3d9device->CreateTexture(hd.Width, hd.Height, 1,
+				D3DUSAGE_RENDERTARGET, hd.Format, D3DPOOL_DEFAULT,
+				&sfxCopyTex, nil);
+			if(hcr != D3D_OK || sfxCopyTex == nil){
+				sfxCopyFailed = 1;
+				if(sfxLogCopy < 8)
+					sfxLogLine("PHOLD create FAILED hr=%08x\n", (unsigned int)hcr);
+				bb->Release();
+				return;
+			}
+			sfxCopyTex->GetSurfaceLevel(0, &sfxCopySurf);
+			sfxCopyW = hd.Width;
+			sfxCopyH = hd.Height;
+		}
+		if(sfxCopySurf == nil || !sfxHoldCaptured){
+			HRESULT hsr = sfxCopySurf != nil
+				? d3d9device->StretchRect(bb, nil, sfxCopySurf, nil, D3DTEXF_NONE)
+				: D3DERR_NOTAVAILABLE;
+			if(hsr == D3D_OK){
+				sfxHoldCaptured = 1;
+				if(sfxLogCopy < 8){
+					sfxLogCopy++;
+					sfxLogLine("PHOLD capture %dx%d\n", sfxCopyW, sfxCopyH);
+				}
+			}else{
+				// a lost device invalidates DEFAULT-pool textures - drop
+				// and retry next pause frame
+				if(sfxCopySurf){ sfxCopySurf->Release(); sfxCopySurf = nil; }
+				if(sfxCopyTex){ sfxCopyTex->Release(); sfxCopyTex = nil; }
+				bb->Release();
+				return;
+			}
+		}
+	}
 	d3d9device->GetRenderState(D3DRS_ZENABLE, &oldZen);
 	d3d9device->GetRenderState(D3DRS_CULLMODE, &oldCull);
 	d3d9device->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlend);
@@ -4270,9 +4157,17 @@ CPostEffects::DrawFinalEffects(void)
 	if(sfxPaused()){
 		// v9.57: paused - no composite; the presented frame stays the
 		// last real one (with HUD) and the menu draws on top
+		// v9.60: the hold lives HERE - DFE is the only post-chain call
+		// that still runs while paused (the T heartbeat proves it);
+		// DeferredStretch never fires because RenderScale_Begin does
+		// not run while paused. Re-presents the frozen copy every pause
+		// frame so the swap chain never serves cleared/stale buffers,
+		// then the vanilla menu draws on top.
+		sfxPauseHold(RwCameraGetRaster(Scene.camera));
 		sfxUFUs = 0;
 		return;
 	}
+	sfxHoldCaptured = 0;
 	if(sfxLogDFE++ < 600)
 		sfxLogLine("DFE n=%d\n", sfxLogDFE);
 
