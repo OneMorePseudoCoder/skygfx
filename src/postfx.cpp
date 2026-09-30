@@ -227,6 +227,10 @@ sfxPaused(void)
 // v9.57: pure-GPU live fill, forward declaration (defined below after
 // the quad helpers; called by UpdateFrontBuffer above them)
 static void sfxGPUFill(RwRaster *src, RwRaster *dst);
+// v9.57b CI fix: sfxGPUFill calls setSceneRaster, which is defined much
+// further down in this file - declare it here first (C3861; the recurring
+// decl-before-use lesson, re-declaring a static prototype is legal).
+static void setSceneRaster(RwRaster *r);
 
 // record which raster is the swap-chain-backed camera raster; the
 // resolve calls this every frame right after landing
@@ -2058,7 +2062,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.57) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.57b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
