@@ -256,8 +256,9 @@ static int sfxLogCopy;
 // last build whose ON state kept the HUD; refreshes 1-2 stay pure GPU.
 static IDirect3DSurface9 *sfxRbSurf;
 static int sfxRbW, sfxRbH;
-static RwRaster *sfxLiveRaster;
-static int sfxLiveW, sfxLiveH;
+// sfxLiveRaster/sfxLiveW/sfxLiveH already exist from the v9.54 block
+// (declared at the top of this file) - they are reused here, NOT
+// redeclared (C2086; grep the whole file before adding any static).
 static int sfxLogRb;
 static void sfxCPUFill(RwRaster *dst);
 // v9.59: pause hold - defined further down (it needs the D3D vtable
@@ -2272,7 +2273,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.59) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.59b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
