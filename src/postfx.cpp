@@ -843,7 +843,7 @@ quadSetUV(RwIm2DVertex *verts, float u0, float v0, float u1, float v1)
 // of the padded target, exactly where the stock RwRasterRenderFast
 // copy lands (v9.36g: a target-sized quad would stretch 1600x900
 // across 2048x1024 and every consumer would read a zoomed crop).
-oid
+void
 CPostEffects::DrawQuadSetUVs(float utl, float vtl, float utr, float vtr, float ubr, float vbr, float ubl, float vbl)
 {
 	RwIm2DVertexSetU(&ms_imf.quad_verts[0], utl, ms_imf.recipZ);
@@ -2109,7 +2109,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.60) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.60b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
