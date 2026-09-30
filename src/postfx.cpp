@@ -209,6 +209,24 @@ static int sfxLogTiming;
 static void sfxLogLine(const char *fmt, ...);
 static int sfxLogU2;
 static int sfxLogBR;
+// v9.57: pause freeze. The game keeps rendering frames while paused
+// (menu over a frozen scene), but the fp16 scene buffer is cleared and
+// receives only the sky gradient, so a resolve overwrites the presented
+// back buffer - which still holds the last real composite, HUD included
+// - with that near-empty gradient. That is the black/white pause
+// background. While either pause flag is set the whole post chain
+// stands down: no resolve, no filter/glow redraw, no composite. The
+// presented frame stays exactly the last composited one (vanilla pause
+// behaviour) and the menu draws on top of it. Address pair verified
+// against plugin-sdk CTimer.cpp (SA 1.0 US).
+static int
+sfxPaused(void)
+{
+	return (*(unsigned char*)0xB7CB48 || *(unsigned char*)0xB7CB49);
+}
+// v9.57: pure-GPU live fill, forward declaration (defined below after
+// the quad helpers; called by UpdateFrontBuffer above them)
+static void sfxGPUFill(RwRaster *src, RwRaster *dst);
 
 // record which raster is the swap-chain-backed camera raster; the
 // resolve calls this every frame right after landing
@@ -315,10 +333,7 @@ CPostEffects::UpdateFrontBuffer(void)
 	// passes (camera on workBuffer) keep the stock path; any fault in
 	// the readback falls back to the stock copy (v9.33 pattern).
 	{
-		IDirect3DSurface9 *bb = nil;
-		D3DSURFACE_DESC d;
-		D3DLOCKED_RECT lr;
-		int done = 0, locked = 0;
+		int done = 0;
 		// v9.53: the v9.52 once-per-frame skip is REVERTED. The log
 		// proved the later refreshes are load-bearing: the radiosity
 		// downsample passes write their SCRATCH into this very raster,
@@ -331,83 +346,26 @@ CPostEffects::UpdateFrontBuffer(void)
 		// The readback cost is now MEASURED per frame (the T line in
 		// the log) so moving the copy fully onto the GPU is decided
 		// on data, not guesswork.
-		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
-		   sfxUFLiveToken == (unsigned int)sfxProbeFrame && sfxLiveRaster != nil){
-			// v9.54: 2nd/3rd refresh of this frame - re-upload the
-			// cached clean copy instead of reading the back buffer
-			// again. Consumers (radiosity source, composite scene)
-			// get THIS frame's clean scene, not the blur scratch and
-			// not a stale copy - and the per-frame readback count
-			// drops from three to one.
-			RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
-			RwRasterRenderFast(sfxLiveRaster, 0, 0);
-			RwRasterPopContext();
+		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
+			// v9.57: one pure-GPU copy of the LIVE back buffer into the
+			// padded front buffer - per refresh, no cache, no readback.
+			// First refresh of a frame = the colour filter's call, and it
+			// captures the resolved scene exactly when the vanilla
+			// semantics say so; the end-of-frame call inside
+			// DrawFinalEffects captures the finished frame WITH the HUD,
+			// so the composite can no longer paint over it. Radiosity
+			// refreshes capture the glow the moment it lands - nothing
+			// cached, nothing stale, nothing to snap between.
+			sfxGPUFill(RwCameraGetRaster(Scene.camera),
+				CPostEffects::pRasterFrontBuffer);
 			done = 1;
-			if(sfxLogFast < 40){
-				sfxLogFast++;
-				sfxLogLine("UF2 fast n=%d pf=%d\n", sfxLogFast, sfxProbeFrame);
+			if(sfxLogLive < 40){
+				sfxLogLive++;
+				sfxLogLine("UF2 gpu n=%d %dx%d pf=%d\n", sfxLogLive,
+					RwRasterGetWidth(CPostEffects::pRasterFrontBuffer),
+					RwRasterGetHeight(CPostEffects::pRasterFrontBuffer),
+					sfxProbeFrame);
 			}
-		}else if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
-		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil &&
-		   bb->GetDesc(&d) == D3D_OK){
-			if(sfxSysSurf == nil ||
-			   sfxSysW != (int)d.Width || sfxSysH != (int)d.Height){
-				if(sfxSysSurf)
-					sfxSysSurf->Release();
-				sfxSysSurf = nil;
-				if(d3d9device->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
-				                                           D3DPOOL_SYSTEMMEM, &sfxSysSurf, nil) == D3D_OK){
-					sfxSysW = d.Width;
-					sfxSysH = d.Height;
-				}
-			}
-			if(sfxSysSurf != nil &&
-			   d3d9device->GetRenderTargetData(bb, sfxSysSurf) == D3D_OK &&
-			   sfxSysSurf->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
-				locked = 1;
-			if(sfxLiveRaster == nil ||
-			   sfxLiveW != (int)d.Width || sfxLiveH != (int)d.Height){
-				if(sfxLiveRaster)
-					RwRasterDestroy(sfxLiveRaster);
-				sfxLiveRaster = RwRasterCreate((int)d.Width, (int)d.Height, 32,
-					rwRASTERTYPETEXTURE | rwRASTERFORMAT8888);
-				sfxLiveW = d.Width;
-				sfxLiveH = d.Height;
-			}
-			if(sfxLiveRaster != nil){
-				unsigned char *dst = (unsigned char*)RwRasterLock(sfxLiveRaster, 0, 1);
-				if(dst != nil){
-					const unsigned char *srcrow = (const unsigned char*)lr.pBits;
-					int dstpitch = RwRasterGetWidth(sfxLiveRaster) * 4;
-					int y, rows = (int)d.Height, cw = (int)d.Width * 4;
-					for(y = 0; y < rows; y++)
-						memcpy(dst + (size_t)y*dstpitch, srcrow + (size_t)y*lr.Pitch, cw);
-					RwRasterUnlock(sfxLiveRaster);
-					RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
-					RwRasterRenderFast(sfxLiveRaster, 0, 0);
-					RwRasterPopContext();
-					done = 1;
-					sfxUFLiveToken = (unsigned int)sfxProbeFrame;
-					if(sfxLogLive < 40){
-						sfxLogLive++;
-						sfxLogLine("UF2 fill n=%d %dx%d pf=%d\n", sfxLogLive, sfxLiveW, sfxLiveH, sfxProbeFrame);
-					}
-				}
-			}
-		}
-		}
-		if(locked && sfxSysSurf)
-			sfxSysSurf->UnlockRect();
-		if(bb)
-			bb->Release();
-		if(!done && sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
-			// v9.52: readback fault with the camera on the presented
-			// buffer - copy RW's cached copy WITHOUT the camera-context
-			// pair (BeginUpdate would clear the presented back buffer)
-			RwRasterPushContext(CPostEffects::pRasterFrontBuffer);
-			RwRasterRenderFast(RwCameraGetRaster(Scene.camera), 0, 0);
-			RwRasterPopContext();
-			done = 1;
 		}
 		if(!done){
 			// camera on a work raster (radiosity ping-pong): the
@@ -783,6 +741,57 @@ quadSetUV(RwIm2DVertex *verts, float u0, float v0, float u1, float v1)
 	RwIm2DVertexSetV(&verts[3], v0, 1.0f);
 }
 
+// v9.57: pure-GPU live fill. The camera raster (the swap-chain back
+// buffer) is drawn as one textured quad INTO the padded front buffer
+// through the proven setSceneRaster camera-raster swap - the exact
+// bracket the radiosity passes and the bloom chain use every frame, so
+// this mid-frame target juggling is as battle-tested as it gets in
+// this build. No GetRenderTargetData, no CPU staging, no cached copy:
+// every refresh sees the LIVE back buffer at the moment of the call,
+// so the colour filter reads this frame's resolve and the end-of-frame
+// composite reads the finished frame INCLUDING the HUD (the v9.53
+// semantics without the 8ms readback that paid for them; the v9.54
+// cache was what fed the composite pre-HUD content - the missing HUD -
+// and pre-glow or ancient content on refill frames - the tint snap).
+// The quad covers the SOURCE raster's own rect: 1:1 into the top-left
+// of the padded target, exactly where the stock RwRasterRenderFast
+// copy lands (v9.36g: a target-sized quad would stretch 1600x900
+// across 2048x1024 and every consumer would read a zoomed crop).
+static void
+sfxGPUFill(RwRaster *src, RwRaster *dst)
+{
+	RwIm2DVertex v[4];
+	float w = (float)RwRasterGetWidth(src);
+	float h = (float)RwRasterGetHeight(src);
+	float nearz = RwIm2DGetNearScreenZ();
+	float nearc = RwCameraGetNearClipPlane(Scene.camera);
+	float recipz = 1.0f / nearc;
+	int i;
+	quadSetXY(v, 0.0f, 0.0f, w, h);
+	quadSetUV(v, 0.0f, 0.0f, 1.0f, 1.0f);
+	for(i = 0; i < 4; i++){
+		RwIm2DVertexSetScreenZ(&v[i], nearz);
+		RwIm2DVertexSetCameraZ(&v[i], nearc);
+		RwIm2DVertexSetRecipCameraZ(&v[i], recipz);
+		RwIm2DVertexSetIntRGBA(&v[i], 255, 255, 255, 255);
+	}
+	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
+	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)src);
+	setSceneRaster(dst);
+	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, v, 4, colorfilterIndices, 6);
+	setSceneRaster(src); // camera back onto the presented raster
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)NULL);
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
+	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+}
+
 void
 CPostEffects::DrawQuadSetUVs(float utl, float vtl, float utr, float vtr, float ubr, float vbr, float ubl, float vbl)
 {
@@ -929,6 +938,9 @@ void
 CPostEffects::Radiosity(int intensityLimit, int filterPasses, int renderPasses, int intensity)
 {
 	sfxRadSeq++;
+	// v9.57: paused - no glow redraw over the frozen frame
+	if(sfxPaused())
+		return;
 /*
 	{
 		static bool keystate = false;
@@ -1141,6 +1153,9 @@ void
 CPostEffects::DarknessFilter_fix(uint8 alpha)
 {
 	sfxDKSeq++;
+	// v9.57: paused - no redraw over the frozen frame
+	if(sfxPaused())
+		return;
 	// v9.44: trace what the vanilla caller feeds the darkness filter -
 	// a binary flip here would also read as a hard night ON/OFF.
 	{
@@ -1565,6 +1580,11 @@ void
 CPostEffects::ColourFilter_switch(RwRGBA rgb1, RwRGBA rgb2)
 {
 	sfxCFSeq++;
+	// v9.57: paused - draw nothing. The frozen frame already carries the
+	// last filter, and re-drawing it every pause frame would accumulate
+	// the wash on the back buffer the freeze is preserving.
+	if(sfxPaused())
+		return;
 
 
 	RwRGBA rgb1pc = rgb1;
@@ -2038,7 +2058,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.56) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.57) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -3463,6 +3483,13 @@ sfxHDRresolve(RwRaster *camR)
 	int i;
 	if(d3d9device == nil || sfxHDRsurf == nil || camR == nil)
 		return 0;
+	// v9.57: paused - the back buffer still holds the last composited
+	// frame; a resolve here would overwrite it with the near-empty fp16
+	// content (cleared scene + sky gradient only - the world does not
+	// redraw while paused). That overwrite was the black/white pause
+	// background.
+	if(sfxPaused())
+		return 0;
 	if(d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK
 		|| bb == nil)
 		return 0;
@@ -3713,7 +3740,11 @@ RenderScale_DeferredStretch(void)
 	// FP16 buffer and are included in the single upscale. (v9.30c
 	// resolved before the window and stretched the already upscaled
 	// frame again - the double zoom in the screenshots.)
-	if(sfxHDRon && sfxHDRresolve(camR)){
+	if(sfxPaused()){
+		// v9.57: paused - the post chain stands down; the presented
+		// back buffer keeps the last composited frame and the pause
+		// menu draws on top of it
+	}else if(sfxHDRon && sfxHDRresolve(camR)){
 		// resolved straight from the FP16 buffer; the RsGlobal and
 		// NoClear cleanup at the end of this function is shared
 		// v9.32/35: remember the swap-chain-backed raster, and fill the
@@ -3922,6 +3953,12 @@ CPostEffects::DrawFinalEffects(void)
 		}
 		sfxFrameLastQPC = n.QuadPart;
 		sfxUFUs = 0;
+	}
+	if(sfxPaused()){
+		// v9.57: paused - no composite; the presented frame stays the
+		// last real one (with HUD) and the menu draws on top
+		sfxUFUs = 0;
+		return;
 	}
 	if(sfxLogDFE++ < 600)
 		sfxLogLine("DFE n=%d\n", sfxLogDFE);
