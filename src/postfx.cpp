@@ -480,7 +480,7 @@ CPostEffects::UpdateFrontBuffer(void)
 				sfxUfBack++;
 				if(sfxUfBackLog > 0){
 					sfxUfBackLog--;
-					sfxLogLine("UFB f=%u\n", sfxFrameNo);
+					sfxLogLine("UFB f=%u\n", sfxProbeFrame);
 				}
 		}
 		if(!done){
@@ -495,7 +495,7 @@ CPostEffects::UpdateFrontBuffer(void)
 				sfxUfWork++;
 				if(sfxUfWorkLog > 0){
 					sfxUfWorkLog--;
-					sfxLogLine("UFW f=%u\n", sfxFrameNo);
+					sfxLogLine("UFW f=%u\n", sfxProbeFrame);
 				}
 		}
 	}
@@ -2146,7 +2146,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.69) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.69b) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
