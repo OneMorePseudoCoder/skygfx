@@ -172,6 +172,7 @@ static int sfxProbeFrame;			// heartbeat, ++ per DFE call
 static unsigned int sfxUfLive, sfxUfBack, sfxUfWork, sfxRadCalls;
 static int sfxUfBackLog = 10, sfxUfWorkLog = 20;
 static int sfxUfHealLog = 10;
+static int sfxUfRelaxLog = 10;
 // v9.71: one bb copy per DFE frame (the GRTD stall x12/window
 // doubled the frame time) + a per-window path census (UFC line).
 static unsigned int sfxUfDidFrame = 0xFFFFFFFFu;
@@ -439,7 +440,16 @@ CPostEffects::UpdateFrontBuffer(void)
 		// ON state (v9.53 is the last build with no snap/HUD complaints).
 		// The readback cost returns (~8-16ms, the postponed FPS item) and
 		// is accepted until the visuals are confirmed fixed.
-		if(!sfxUfSkip && sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
+		// v9.72 THE FIX: the camera-raster requirement is DROPPED. The
+		// v9.71 log proved both per-frame refreshes run while the camera
+		// holds a WORK raster (UFC L=0 B=0 W=32), so this path never
+		// engaged and the filter's raster was fed by the work-fallback -
+		// at night that is the radiosity scratch (CFC2 d=+28,+41,+11),
+		// and during pause those copies overwrite the good content (the
+		// B/W takeover). GetRenderTargetData reads the swap-chain surface
+		// directly and touches no camera context - safe at ANY point of
+		// the frame. One copy per frame stays (FPS preserved).
+		if(!sfxUfSkip && sfxBBRaster != nil &&
 		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil &&
 		   bb->GetDesc(&d) == D3D_OK){
 			if(sfxSysSurf == nil ||
@@ -505,6 +515,10 @@ CPostEffects::UpdateFrontBuffer(void)
 						RwRasterPopContext();
 						done = 1;
 						sfxUfLive++;
+						if(sfxUfRelaxLog > 0 && RwCameraGetRaster(Scene.camera) != sfxBBRaster){
+							sfxUfRelaxLog--;
+							sfxLogLine("UF3 relaxed-live pf=%d\n", sfxProbeFrame);
+						}
 						sfxCenL++;
 						sfxUfDidFrame = (unsigned)sfxProbeFrame;
 						if(sfxLogLive < 40){
@@ -2199,7 +2213,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.71) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.72) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
