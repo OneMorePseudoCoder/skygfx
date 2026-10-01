@@ -2126,7 +2126,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.67) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.68) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2995,6 +2995,99 @@ static int sfxProbeWhiteDiag;
 static int sfxProbeAvR = -1, sfxProbeAvG, sfxProbeAvB;
 static int sfxProbeSnapSeq, sfxProbeSnapBudget = 120;
 static int sfxProbeAvSeq;
+// v9.68 probe: compare the colour-filter texture source
+// (CPostEffects::pRasterFrontBuffer) with the live back buffer on the
+// SAME frame. The PS2/PC filter modulates the whole screen with this
+// raster, so a stale or scratch-contaminated source would tint every
+// frame differently while the game's own filter colours stay constant
+// (CFC stable; AE/bloom/radiosity/dualPass all eliminated by tests).
+// Also prints the source size - the radiosity passes are known to use
+// this raster as scratch, so quarter-size content would show here.
+// Read-only: the readback the probes already use plus a plain-raster
+// read lock. Logs on divergence (the SNAP 12-unit magnitude) or every
+// 16th sample; budget 60 lines.
+static void
+sfxProbeCFCMP(void)
+{
+	IDirect3DDevice9 *dev = d3d9device;
+	IDirect3DSurface9 *bb = nil, *sys = nil;
+	D3DSURFACE_DESC d;
+	D3DLOCKED_RECT lr;
+	RwRaster *fb = CPostEffects::pRasterFrontBuffer;
+	unsigned int i;
+	int avR, avG, avB, fbR, fbG, fbB;
+	static int sfxCfLog = 60;
+	static int sfxCfSeq;
+	if(dev == nil || fb == nil || sfxCfLog <= 0)
+		return;
+	if((sfxFrameNo & 7) != 2)
+		return;
+	if(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || bb == nil)
+		return;
+	if(bb->GetDesc(&d) != D3D_OK ||
+	   dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+	                                    D3DPOOL_SYSTEMMEM, &sys, nil) != D3D_OK ||
+	   dev->GetRenderTargetData(bb, sys) != D3D_OK ||
+	   sys->LockRect(&lr, nil, D3DLOCK_READONLY) != D3D_OK){
+		if(sys) sys->Release();
+		bb->Release();
+		return;
+	}
+	{
+		int sr = 0, sg = 0, sb = 0;
+		for(i = 0; i < 144; i++){
+			unsigned int sc = *(unsigned int*)((unsigned char*)lr.pBits
+				+ (d.Height/18 + (i/16)*(d.Height/9))*lr.Pitch
+				+ (d.Width/32 + (i%16)*(d.Width/16))*4);
+			sr += (int)((sc >> 16) & 0xFF);
+			sg += (int)((sc >> 8) & 0xFF);
+			sb += (int)(sc & 0xFF);
+		}
+		avR = sr/144; avG = sg/144; avB = sb/144;
+	}
+	sys->UnlockRect();
+	sys->Release();
+	bb->Release();
+	{
+		// the filter's source raster is plain system memory (the stock
+		// UpdateFrontBuffer copy writes it with the same lock class)
+		unsigned char *px = (unsigned char*)RwRasterLock(fb, 0, 2);
+		int fw, fh, pitch, sr = 0, sg = 0, sb = 0;
+		if(px == nil){
+			if(sfxCfSeq % 16 == 0 && sfxCfLog > 0){
+				sfxCfLog--;
+				sfxLogLine("CFCMP fb lock failed\n");
+			}
+			sfxCfSeq++;
+			return;
+		}
+		fw = RwRasterGetWidth(fb);
+		fh = RwRasterGetHeight(fb);
+		pitch = fw * 4;
+		for(i = 0; i < 144; i++){
+			unsigned int sc = *(unsigned int*)(px
+				+ (fh/18 + (i/16)*(fh/9))*pitch
+				+ (fw/32 + (i%16)*(fw/16))*4);
+			sr += (int)((sc >> 16) & 0xFF);
+			sg += (int)((sc >> 8) & 0xFF);
+			sb += (int)(sc & 0xFF);
+		}
+		fbR = sr/144; fbG = sg/144; fbB = sb/144;
+		RwRasterUnlock(fb);
+	}
+	{
+		int dR = fbR - avR, dG = fbG - avG, dB = fbB - avB;
+		int mag = (dR < 0 ? -dR : dR) + (dG < 0 ? -dG : dG) + (dB < 0 ? -dB : dB);
+		sfxCfSeq++;
+		if((mag > 12 || (sfxCfSeq & 15) == 1) && sfxCfLog > 0){
+			sfxCfLog--;
+			sfxLogLine("CFCMP f=%u fb=%dx%d avFB=%d,%d,%d avBB=%d,%d,%d d=%d,%d,%d\n",
+				sfxFrameNo, RwRasterGetWidth(fb), RwRasterGetHeight(fb),
+				fbR, fbG, fbB, avR, avG, avB, dR, dG, dB);
+		}
+	}
+}
+
 // v9.43: camera direction helper shared by the colour/angle logs
 static void
 sfxCamAngles(int *pit, int *hea)
@@ -3705,6 +3798,8 @@ sfxHDRresolve(RwRaster *camR)
 	// v9.30o: did the quad actually land? Content of the back buffer
 	// right now - pairs with the end-of-composite BB probe of this frame.
 	sfxProbeResolveBB();
+	// v9.68 probe: is the filter's texture source fresh? (CFCMP)
+	sfxProbeCFCMP();
 	// detach the FP16 texture again and restore what was switched off;
 	// RW re-issues its own state on the next camera/draw cycle
 	d3d9device->SetTexture(0, nil);
