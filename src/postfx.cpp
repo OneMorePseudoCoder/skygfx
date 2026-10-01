@@ -171,6 +171,7 @@ static int sfxProbeFrame;			// heartbeat, ++ per DFE call
 // be attributed to the writer that ran last before the filter.
 static unsigned int sfxUfLive, sfxUfBack, sfxUfWork, sfxRadCalls;
 static int sfxUfBackLog = 10, sfxUfWorkLog = 20;
+static int sfxUfHealLog = 10;
 
 // ---- v9.32: live front buffer for the hdr path ----------------------
 // The 931-run log proved cam==bb:1 - the camera raster IS the
@@ -434,6 +435,31 @@ CPostEffects::UpdateFrontBuffer(void)
 					sfxSysH = d.Height;
 				}
 			}
+			// v9.70: a failed readback used to stay failed forever - the
+			// cached surface was kept even when GRTD/LockRect rejected it,
+			// and the missing UnlockRect below poisoned it right after the
+			// first successful fill (v9.69b log: UFB from frame 3, zero
+			// live fills all session). Log the HRESULT once, drop the
+			// surface and recreate it fresh for the retry below.
+			if(sfxSysSurf != nil){
+				HRESULT sfxUfHr = d3d9device->GetRenderTargetData(bb, sfxSysSurf);
+				if(sfxUfHr == D3D_OK)
+					sfxUfHr = sfxSysSurf->LockRect(&lr, nil, D3DLOCK_READONLY);
+				if(sfxUfHr != D3D_OK){
+					if(sfxUfHealLog > 0){
+						sfxUfHealLog--;
+						sfxLogLine("UFL pf=%u hr=%08x recreate\n", sfxProbeFrame, sfxUfHr);
+					}
+					sfxSysSurf->Release();
+					sfxSysSurf = nil;
+				}
+			}
+			if(sfxSysSurf == nil &&
+			   d3d9device->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format,
+			                                           D3DPOOL_SYSTEMMEM, &sfxSysSurf, nil) == D3D_OK){
+				sfxSysW = d.Width;
+				sfxSysH = d.Height;
+			}
 			if(sfxSysSurf != nil &&
 			   d3d9device->GetRenderTargetData(bb, sfxSysSurf) == D3D_OK &&
 			   sfxSysSurf->LockRect(&lr, nil, D3DLOCK_READONLY) == D3D_OK){
@@ -467,6 +493,10 @@ CPostEffects::UpdateFrontBuffer(void)
 						}
 					}
 				}
+				// v9.70 THE FIX: the surface stayed locked after the first
+				// successful fill - every later GetRenderTargetData on it
+				// failed and the live path died for the whole session.
+				sfxSysSurf->UnlockRect();
 			}
 		}
 		if(!done && sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
@@ -628,8 +658,6 @@ CPostEffects::Radiosity_VCS_init(void)
 void
 CPostEffects::Radiosity_VCS(int limit, int intensity)
 {
-	sfxRadCalls++;
-
 	static int lastWidth, lastHeight, lastConfigRes;
 	int i;
 	int resMult = config->trailsResolution;
@@ -920,6 +948,8 @@ void *blurPS, *radiosityPS;
 void
 CPostEffects::Radiosity_shader(int intensityLimit, int filterPasses, int renderPasses, int intensity)
 {
+	sfxRadCalls++;
+
 	static RwRaster *workBuffer;
 	// v9.46: effective (post-fade) radiosity add on a slow heartbeat
 	if((sfxRadSeq & 15) == 0 && sfxLogRadRun < 200){
@@ -2146,7 +2176,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.69b) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.70) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
