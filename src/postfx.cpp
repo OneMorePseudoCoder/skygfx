@@ -172,6 +172,10 @@ static int sfxProbeFrame;			// heartbeat, ++ per DFE call
 static unsigned int sfxUfLive, sfxUfBack, sfxUfWork, sfxRadCalls;
 static int sfxUfBackLog = 10, sfxUfWorkLog = 20;
 static int sfxUfHealLog = 10;
+// v9.71: one bb copy per DFE frame (the GRTD stall x12/window
+// doubled the frame time) + a per-window path census (UFC line).
+static unsigned int sfxUfDidFrame = 0xFFFFFFFFu;
+static int sfxCenL, sfxCenB, sfxCenW, sfxCenLast = -1, sfxCenLog = 60;
 
 // ---- v9.32: live front buffer for the hdr path ----------------------
 // The 931-run log proved cam==bb:1 - the camera raster IS the
@@ -343,6 +347,20 @@ CPostEffects::UpdateFrontBuffer(void)
 	LARGE_INTEGER c0, c1;
 	QueryPerformanceCounter(&c0);
 	// v9.32: hdr path - the camera raster is the swap-chain back
+	// v9.71: once-per-frame gate + census. The v9.70 log showed the
+	// live fill working (u=12) while the raster STILL ended green-
+	// contaminated (three writers) and the frame time doubled - the
+	// GRTD stall, not the memcpy, is the cost. One bb copy per frame
+	// from now on; later camera-on-bb refreshes are no-ops. The
+	// radiosity work-raster path (vanilla glow feed) is untouched.
+	int sfxUfSkip = (sfxUfDidFrame == (unsigned)sfxProbeFrame);
+	if((sfxProbeFrame & 15) == 0 && sfxCenLast != sfxProbeFrame && sfxCenLog > 0){
+		sfxCenLog--;
+		sfxCenLast = sfxProbeFrame;
+		sfxLogLine("UFC pf=%u L=%d B=%d W=%d\n",
+			sfxProbeFrame, sfxCenL, sfxCenB, sfxCenW);
+		sfxCenL = 0; sfxCenB = 0; sfxCenW = 0;
+	}
 	// buffer, so the stock copy below would feed the chain RW's stale
 	// system copy of it (the frozen beige). Fill the front buffer from
 	// the live back buffer instead. Radiosity ping-pong copies (camera
@@ -421,7 +439,7 @@ CPostEffects::UpdateFrontBuffer(void)
 		// ON state (v9.53 is the last build with no snap/HUD complaints).
 		// The readback cost returns (~8-16ms, the postponed FPS item) and
 		// is accepted until the visuals are confirmed fixed.
-		if(sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
+		if(!sfxUfSkip && sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster &&
 		   d3d9device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb != nil &&
 		   bb->GetDesc(&d) == D3D_OK){
 			if(sfxSysSurf == nil ||
@@ -487,6 +505,8 @@ CPostEffects::UpdateFrontBuffer(void)
 						RwRasterPopContext();
 						done = 1;
 						sfxUfLive++;
+						sfxCenL++;
+						sfxUfDidFrame = (unsigned)sfxProbeFrame;
 						if(sfxLogLive < 40){
 							sfxLogLive++;
 							sfxLogLine("UF2 fill n=%d %dx%d pf=%d\n", sfxLogLive, sfxLiveW, sfxLiveH, sfxProbeFrame);
@@ -499,7 +519,7 @@ CPostEffects::UpdateFrontBuffer(void)
 				sfxSysSurf->UnlockRect();
 			}
 		}
-		if(!done && sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
+		if(!done && !sfxUfSkip && sfxBBRaster != nil && RwCameraGetRaster(Scene.camera) == sfxBBRaster){
 			// readback fault with the camera on the presented buffer -
 			// copy RW's cached copy WITHOUT the camera-context pair
 			// (BeginUpdate would clear the presented back buffer)
@@ -508,6 +528,8 @@ CPostEffects::UpdateFrontBuffer(void)
 			RwRasterPopContext();
 			done = 1;
 				sfxUfBack++;
+				sfxCenB++;
+				sfxUfDidFrame = (unsigned)sfxProbeFrame;
 				if(sfxUfBackLog > 0){
 					sfxUfBackLog--;
 					sfxLogLine("UFB f=%u\n", sfxProbeFrame);
@@ -523,6 +545,7 @@ CPostEffects::UpdateFrontBuffer(void)
 			RwRasterPopContext();
 			RwCameraBeginUpdate(Scene.camera);
 				sfxUfWork++;
+				sfxCenW++;
 				if(sfxUfWorkLog > 0){
 					sfxUfWorkLog--;
 					sfxLogLine("UFW f=%u\n", sfxProbeFrame);
@@ -2176,7 +2199,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.70) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.71) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
