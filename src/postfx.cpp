@@ -164,6 +164,13 @@ static FILE *sfxLog;
 // per-frame fill cache on it (C2065 in CI build a3254a3: it used to
 // be declared ~1600 lines below this first use)
 static int sfxProbeFrame;			// heartbeat, ++ per DFE call
+// v9.69 probe: order stamps for the filter-source investigation.
+// UpdateFrontBuffer counts which copy path ran (live readback /
+// bb fallback / work-raster fallback) and Radiosity_VCS counts its
+// calls; sfxProbeCFCMP prints the deltas so content divergence can
+// be attributed to the writer that ran last before the filter.
+static unsigned int sfxUfLive, sfxUfBack, sfxUfWork, sfxRadCalls;
+static int sfxUfBackLog = 10, sfxUfWorkLog = 20;
 
 // ---- v9.32: live front buffer for the hdr path ----------------------
 // The 931-run log proved cam==bb:1 - the camera raster IS the
@@ -453,6 +460,7 @@ CPostEffects::UpdateFrontBuffer(void)
 						RwRasterRenderFast(sfxLiveRaster, 0, 0);
 						RwRasterPopContext();
 						done = 1;
+						sfxUfLive++;
 						if(sfxLogLive < 40){
 							sfxLogLive++;
 							sfxLogLine("UF2 fill n=%d %dx%d pf=%d\n", sfxLogLive, sfxLiveW, sfxLiveH, sfxProbeFrame);
@@ -469,6 +477,11 @@ CPostEffects::UpdateFrontBuffer(void)
 			RwRasterRenderFast(RwCameraGetRaster(Scene.camera), 0, 0);
 			RwRasterPopContext();
 			done = 1;
+				sfxUfBack++;
+				if(sfxUfBackLog > 0){
+					sfxUfBackLog--;
+					sfxLogLine("UFB f=%u\n", sfxFrameNo);
+				}
 		}
 		if(!done){
 			// camera on a work raster (radiosity ping-pong): the
@@ -479,6 +492,11 @@ CPostEffects::UpdateFrontBuffer(void)
 			RwRasterRenderFast(RwCameraGetRaster(Scene.camera), 0, 0);
 			RwRasterPopContext();
 			RwCameraBeginUpdate(Scene.camera);
+				sfxUfWork++;
+				if(sfxUfWorkLog > 0){
+					sfxUfWorkLog--;
+					sfxLogLine("UFW f=%u\n", sfxFrameNo);
+				}
 		}
 	}
 	QueryPerformanceCounter(&c1);
@@ -610,6 +628,8 @@ CPostEffects::Radiosity_VCS_init(void)
 void
 CPostEffects::Radiosity_VCS(int limit, int intensity)
 {
+	sfxRadCalls++;
+
 	static int lastWidth, lastHeight, lastConfigRes;
 	int i;
 	int resMult = config->trailsResolution;
@@ -2126,7 +2146,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.68) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.69) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -2995,17 +3015,17 @@ static int sfxProbeWhiteDiag;
 static int sfxProbeAvR = -1, sfxProbeAvG, sfxProbeAvB;
 static int sfxProbeSnapSeq, sfxProbeSnapBudget = 120;
 static int sfxProbeAvSeq;
-// v9.68 probe: compare the colour-filter texture source
-// (CPostEffects::pRasterFrontBuffer) with the live back buffer on the
-// SAME frame. The PS2/PC filter modulates the whole screen with this
-// raster, so a stale or scratch-contaminated source would tint every
-// frame differently while the game's own filter colours stay constant
-// (CFC stable; AE/bloom/radiosity/dualPass all eliminated by tests).
-// Also prints the source size - the radiosity passes are known to use
-// this raster as scratch, so quarter-size content would show here.
-// Read-only: the readback the probes already use plus a plain-raster
-// read lock. Logs on divergence (the SNAP 12-unit magnitude) or every
-// 16th sample; budget 60 lines.
+// v9.69 probe v2: content-only comparison. v9.68 proved the filter's
+// source raster is 2048x1024 while the live copy only covers the
+// top-left back-buffer-sized rectangle - the v1 grid also sampled the
+// never-refreshed padding, so avFB mixed content with stale memory.
+// v2 samples ONLY the rectangle the filter's UVs actually cover (the
+// content area, same fractions as the BB grid) and prints the order
+// stamps (UF live / bb-fallback / work-raster fallback since the last
+// sample, radiosity calls since the last sample) so a content
+// divergence can be attributed to the writer that ran last before
+// the filter sampled the raster. Read-only; logs on divergence
+// (mag 12) or every 16th sample; budget 80 lines.
 static void
 sfxProbeCFCMP(void)
 {
@@ -3016,8 +3036,10 @@ sfxProbeCFCMP(void)
 	RwRaster *fb = CPostEffects::pRasterFrontBuffer;
 	unsigned int i;
 	int avR, avG, avB, fbR, fbG, fbB;
-	static int sfxCfLog = 60;
+	int cw, ch;
+	static int sfxCfLog = 80;
 	static int sfxCfSeq;
+	static unsigned int sfxCfMuL, sfxCfMuB, sfxCfMuW, sfxCfMr;
 	if(dev == nil || fb == nil || sfxCfLog <= 0)
 		return;
 	if((sfxFrameNo & 7) != 2)
@@ -3048,15 +3070,20 @@ sfxProbeCFCMP(void)
 	sys->UnlockRect();
 	sys->Release();
 	bb->Release();
+	cw = (int)d.Width;
+	ch = (int)d.Height;
+	if(cw > (int)RwRasterGetWidth(fb))
+		cw = (int)RwRasterGetWidth(fb);
+	if(ch > (int)RwRasterGetHeight(fb))
+		ch = (int)RwRasterGetHeight(fb);
 	{
-		// the filter's source raster is plain system memory (the stock
-		// UpdateFrontBuffer copy writes it with the same lock class)
+		// content-rectangle lock - the same lock class the live fill uses
 		unsigned char *px = (unsigned char*)RwRasterLock(fb, 0, 2);
 		int fw, fh, pitch, sr = 0, sg = 0, sb = 0;
 		if(px == nil){
 			if(sfxCfSeq % 16 == 0 && sfxCfLog > 0){
 				sfxCfLog--;
-				sfxLogLine("CFCMP fb lock failed\n");
+				sfxLogLine("CFC2 fb lock failed\n");
 			}
 			sfxCfSeq++;
 			return;
@@ -3066,8 +3093,8 @@ sfxProbeCFCMP(void)
 		pitch = fw * 4;
 		for(i = 0; i < 144; i++){
 			unsigned int sc = *(unsigned int*)(px
-				+ (fh/18 + (i/16)*(fh/9))*pitch
-				+ (fw/32 + (i%16)*(fw/16))*4);
+				+ (ch/18 + (i/16)*(ch/9))*pitch
+				+ (cw/32 + (i%16)*(cw/16))*4);
 			sr += (int)((sc >> 16) & 0xFF);
 			sg += (int)((sc >> 8) & 0xFF);
 			sb += (int)(sc & 0xFF);
@@ -3078,12 +3105,17 @@ sfxProbeCFCMP(void)
 	{
 		int dR = fbR - avR, dG = fbG - avG, dB = fbB - avB;
 		int mag = (dR < 0 ? -dR : dR) + (dG < 0 ? -dG : dG) + (dB < 0 ? -dB : dB);
+		unsigned int ul = sfxUfLive - sfxCfMuL, ub = sfxUfBack - sfxCfMuB;
+		unsigned int uw = sfxUfWork - sfxCfMuW, ur = sfxRadCalls - sfxCfMr;
+		sfxCfMuL = sfxUfLive; sfxCfMuB = sfxUfBack;
+		sfxCfMuW = sfxUfWork; sfxCfMr = sfxRadCalls;
 		sfxCfSeq++;
 		if((mag > 12 || (sfxCfSeq & 15) == 1) && sfxCfLog > 0){
 			sfxCfLog--;
-			sfxLogLine("CFCMP f=%u fb=%dx%d avFB=%d,%d,%d avBB=%d,%d,%d d=%d,%d,%d\n",
-				sfxFrameNo, RwRasterGetWidth(fb), RwRasterGetHeight(fb),
-				fbR, fbG, fbB, avR, avG, avB, dR, dG, dB);
+			sfxLogLine("CFC2 f=%u fb=%dx%d cn=%dx%d avFB=%d,%d,%d avBB=%d,%d,%d d=%d,%d,%d u=%u/%u/%u r=%u\n",
+				sfxFrameNo, RwRasterGetWidth(fb), RwRasterGetHeight(fb), cw, ch,
+				fbR, fbG, fbB, avR, avG, avB, dR, dG, dB,
+				ul, ub, uw, ur);
 		}
 	}
 }
